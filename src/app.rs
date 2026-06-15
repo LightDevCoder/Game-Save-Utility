@@ -1,0 +1,997 @@
+use crate::backup;
+use crate::config;
+use crate::fs_utils::format_size;
+use crate::i18n::{t, Text as T};
+use crate::logger;
+use crate::models::{
+    AppConfig, AppError, AppResult, BackupEntry, CloseBehavior, GameConfig, Language, PresetGame,
+    StatusKind, StatusMessage, MAIN_WINDOW_MIN_HEIGHT, MAIN_WINDOW_MIN_WIDTH,
+};
+use crate::presets;
+use crate::steam::{self, SteamGameCandidate};
+use crate::tray;
+use eframe::egui;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GameForm {
+    pub name: String,
+    pub save_path: String,
+    pub max_backups: String,
+    pub auto_cleanup_enabled: bool,
+    pub preset_index: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ConfirmAction {
+    BackupEmptySaveDir { game_id: String },
+    RestoreBackup { backup_path: PathBuf },
+    DeleteBackup { backup_path: PathBuf },
+    DeleteGame { game_id: String },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SteamScanAction {
+    AddSelected { app_id: String, save_path: PathBuf },
+    AddAll,
+    Rescan,
+    Close,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SteamScanDialogState {
+    pub(crate) open: bool,
+    pub(crate) candidates: Vec<SteamGameCandidate>,
+    pub(crate) selected_app_id: Option<String>,
+    pub(crate) selected_save_path: Option<PathBuf>,
+    pub(crate) pending_action: Option<SteamScanAction>,
+    pub(crate) list_width: f32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HelpWindowState {
+    pub(crate) open: bool,
+    pub(crate) selected_topic_id: String,
+    pub(crate) search: String,
+    pub(crate) search_mode: bool,
+}
+
+impl HelpWindowState {
+    pub(crate) fn new() -> Self {
+        Self {
+            open: true,
+            selected_topic_id: crate::help::default_topic_id().to_owned(),
+            search: String::new(),
+            search_mode: false,
+        }
+    }
+}
+
+impl SteamScanDialogState {
+    pub(crate) fn from_candidates(candidates: Vec<SteamGameCandidate>) -> Self {
+        let selected_app_id = candidates.first().map(|candidate| candidate.app_id.clone());
+        let selected_save_path = selected_app_id
+            .as_ref()
+            .and_then(|app_id| {
+                candidates
+                    .iter()
+                    .find(|candidate| &candidate.app_id == app_id)
+            })
+            .and_then(SteamGameCandidate::recommended_save_path);
+
+        Self {
+            open: true,
+            candidates,
+            selected_app_id,
+            selected_save_path,
+            pending_action: None,
+            list_width: 380.0,
+        }
+    }
+
+    pub(crate) fn select_candidate(&mut self, app_id: String) {
+        self.selected_app_id = Some(app_id.clone());
+        self.selected_save_path = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.app_id == app_id)
+            .and_then(SteamGameCandidate::recommended_save_path);
+    }
+
+    pub(crate) fn selected_candidate(&self) -> Option<&SteamGameCandidate> {
+        self.selected_app_id.as_ref().and_then(|app_id| {
+            self.candidates
+                .iter()
+                .find(|candidate| &candidate.app_id == app_id)
+        })
+    }
+}
+
+pub struct GameSaveApp {
+    pub(crate) config: AppConfig,
+    pub(crate) selected_game_id: Option<String>,
+    pub(crate) backups: Vec<BackupEntry>,
+    pub(crate) selected_backup_path: Option<PathBuf>,
+    pub(crate) backup_label: String,
+    pub(crate) status: StatusMessage,
+    pub(crate) presets: Vec<PresetGame>,
+    pub(crate) show_game_dialog: bool,
+    pub(crate) show_steam_scan_dialog: bool,
+    pub(crate) editing_game_id: Option<String>,
+    pub(crate) game_form: GameForm,
+    pub(crate) confirm_action: Option<ConfirmAction>,
+    pub(crate) delete_backups_with_game: bool,
+    pub(crate) steam_candidates: Vec<SteamGameCandidate>,
+    pub(crate) selected_steam_app_id: Option<String>,
+    pub(crate) selected_steam_save_path: Option<PathBuf>,
+    pub(crate) steam_scan_state: Option<Arc<Mutex<SteamScanDialogState>>>,
+    pub(crate) app_icon: Option<Arc<egui::IconData>>,
+    pub(crate) main_hwnd: Option<tray::WindowHandle>,
+    pub(crate) show_close_behavior_dialog: bool,
+    pub(crate) help_window_state: Option<Arc<Mutex<HelpWindowState>>>,
+    pub(crate) force_exit_requested: bool,
+    pub(crate) last_window_settings_save: Instant,
+}
+
+impl GameSaveApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, app_icon: Option<Arc<egui::IconData>>) -> Self {
+        configure_fonts(&cc.egui_ctx);
+        let main_hwnd = tray::hwnd_from_creation_context(cc);
+        if let Some(hwnd) = main_hwnd {
+            tray::init(hwnd);
+        }
+
+        let logger_error = logger::init().err();
+
+        let config = match config::load_or_create_config() {
+            Ok(config) => config,
+            Err(err) => {
+                logger::error(format!("配置读取失败: {}", err.user_message()));
+                let status = StatusMessage::error(format!(
+                    "配置读取失败，已使用临时默认配置: {}",
+                    err.user_message()
+                ));
+                let config = config::default_config().unwrap_or_else(|_| AppConfig {
+                    backup_root: PathBuf::from("backups"),
+                    games: Vec::new(),
+                    settings: Default::default(),
+                });
+                return Self::from_config(cc, app_icon, main_hwnd, config, status);
+            }
+        };
+        let status = if let Some(err) = logger_error {
+            match config.settings.language {
+                Language::ZhCn => {
+                    StatusMessage::warning(format!("日志初始化失败: {}", err.user_message()))
+                }
+                Language::EnUs => StatusMessage::warning(format!(
+                    "Log initialization failed: {}",
+                    err.user_message()
+                )),
+            }
+        } else {
+            StatusMessage::info(t(config.settings.language, T::Ready))
+        };
+
+        Self::from_config(cc, app_icon, main_hwnd, config, status)
+    }
+
+    fn from_config(
+        _cc: &eframe::CreationContext<'_>,
+        app_icon: Option<Arc<egui::IconData>>,
+        main_hwnd: Option<tray::WindowHandle>,
+        config: AppConfig,
+        status: StatusMessage,
+    ) -> Self {
+        tray::set_language(config.settings.language);
+        let selected_game_id = config.games.first().map(|game| game.id.clone());
+        let mut app = Self {
+            config,
+            selected_game_id,
+            backups: Vec::new(),
+            selected_backup_path: None,
+            backup_label: String::new(),
+            status,
+            presets: presets::built_in_presets(),
+            show_game_dialog: false,
+            show_steam_scan_dialog: false,
+            editing_game_id: None,
+            game_form: GameForm::default(),
+            confirm_action: None,
+            delete_backups_with_game: false,
+            steam_candidates: Vec::new(),
+            selected_steam_app_id: None,
+            selected_steam_save_path: None,
+            steam_scan_state: None,
+            app_icon,
+            main_hwnd,
+            show_close_behavior_dialog: false,
+            help_window_state: None,
+            force_exit_requested: false,
+            last_window_settings_save: Instant::now(),
+        };
+        app.refresh_backups();
+        app
+    }
+
+    pub(crate) fn language(&self) -> Language {
+        self.config.settings.language
+    }
+
+    pub(crate) fn text(&self, text: T) -> &'static str {
+        t(self.language(), text)
+    }
+
+    pub(crate) fn toggle_language(&mut self, ctx: &egui::Context) {
+        self.config.settings.language = self.config.settings.language.toggled();
+        self.status = StatusMessage::success(self.text(T::LanguageChanged));
+        self.save_config();
+        tray::set_language(self.language());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            self.text(T::AppTitle).to_owned(),
+        ));
+    }
+
+    pub(crate) fn selected_game(&self) -> Option<&GameConfig> {
+        self.selected_game_id
+            .as_ref()
+            .and_then(|id| self.config.games.iter().find(|game| &game.id == id))
+    }
+
+    pub(crate) fn select_game(&mut self, game_id: String) {
+        self.selected_game_id = Some(game_id);
+        self.selected_backup_path = None;
+        self.backup_label.clear();
+        self.refresh_backups();
+    }
+
+    pub(crate) fn refresh_backups(&mut self) {
+        let Some(game) = self.selected_game().cloned() else {
+            self.backups.clear();
+            self.selected_backup_path = None;
+            return;
+        };
+
+        match backup::scan_backups(&self.config, &game) {
+            Ok(backups) => {
+                self.backups = backups;
+                if let Some(selected_path) = &self.selected_backup_path {
+                    if !self
+                        .backups
+                        .iter()
+                        .any(|entry| &entry.path == selected_path)
+                    {
+                        self.selected_backup_path = None;
+                    }
+                }
+            }
+            Err(err) => {
+                self.backups.clear();
+                self.selected_backup_path = None;
+                self.set_error(err);
+            }
+        }
+    }
+
+    pub(crate) fn save_config(&mut self) {
+        match config::save_config(&self.config) {
+            Ok(()) => {
+                logger::info("配置保存完成");
+            }
+            Err(err) => {
+                logger::error(format!("配置保存失败: {}", err.user_message()));
+                self.set_error(err);
+            }
+        }
+    }
+
+    pub(crate) fn open_add_game_dialog(&mut self) {
+        self.editing_game_id = None;
+        self.game_form = GameForm {
+            max_backups: "20".to_owned(),
+            auto_cleanup_enabled: true,
+            ..Default::default()
+        };
+        self.show_game_dialog = true;
+    }
+
+    pub(crate) fn open_edit_game_dialog(&mut self) {
+        let Some(game) = self.selected_game().cloned() else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择一个游戏",
+                Language::EnUs => "Select a game first",
+            });
+            return;
+        };
+
+        self.editing_game_id = Some(game.id);
+        self.game_form = GameForm {
+            name: game.name,
+            save_path: game.save_path.to_string_lossy().to_string(),
+            max_backups: game
+                .max_backups
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            auto_cleanup_enabled: game.auto_cleanup_enabled,
+            preset_index: None,
+        };
+        self.show_game_dialog = true;
+    }
+
+    pub(crate) fn submit_game_form(&mut self) {
+        match self.build_game_from_form() {
+            Ok(mut game) => {
+                if let Some(editing_id) = self.editing_game_id.clone() {
+                    game.id = editing_id.clone();
+                    if let Some(existing) = self
+                        .config
+                        .games
+                        .iter_mut()
+                        .find(|item| item.id == editing_id)
+                    {
+                        *existing = game;
+                    }
+                } else {
+                    self.selected_game_id = Some(game.id.clone());
+                    self.config.games.push(game);
+                }
+
+                self.show_game_dialog = false;
+                self.save_config();
+                self.refresh_backups();
+                self.status = StatusMessage::success(match self.language() {
+                    Language::ZhCn => "游戏配置已保存",
+                    Language::EnUs => "Game config saved",
+                });
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn build_game_from_form(&self) -> AppResult<GameConfig> {
+        let name = self.game_form.name.trim();
+        if name.is_empty() {
+            return Err(AppError::message(match self.language() {
+                Language::ZhCn => "游戏名称不能为空",
+                Language::EnUs => "Game name cannot be empty",
+            }));
+        }
+        let editing_id = self.editing_game_id.as_deref();
+        if self
+            .config
+            .games
+            .iter()
+            .any(|game| game.name == name && Some(game.id.as_str()) != editing_id)
+        {
+            return Err(AppError::message(match self.language() {
+                Language::ZhCn => "已存在同名游戏配置，请使用不同名称",
+                Language::EnUs => "A game with this name already exists",
+            }));
+        }
+
+        let save_path = self.game_form.save_path.trim();
+        if save_path.is_empty() {
+            return Err(AppError::message(match self.language() {
+                Language::ZhCn => "存档目录不能为空",
+                Language::EnUs => "Save folder cannot be empty",
+            }));
+        }
+
+        let max_backups = if self.game_form.max_backups.trim().is_empty() {
+            None
+        } else {
+            let value = self
+                .game_form
+                .max_backups
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| {
+                    AppError::message(match self.language() {
+                        Language::ZhCn => "最大备份数量必须是正整数或留空",
+                        Language::EnUs => "Max backups must be a positive integer or blank",
+                    })
+                })?;
+            if value == 0 {
+                return Err(AppError::message(match self.language() {
+                    Language::ZhCn => "最大备份数量不能为 0；如不限制请留空",
+                    Language::EnUs => "Max backups cannot be 0; leave blank for unlimited",
+                }));
+            }
+            Some(value)
+        };
+
+        Ok(GameConfig {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            save_path: PathBuf::from(save_path),
+            max_backups,
+            auto_cleanup_enabled: self.game_form.auto_cleanup_enabled,
+        })
+    }
+
+    pub(crate) fn start_backup(&mut self, allow_empty: bool) {
+        let Some(game) = self.selected_game().cloned() else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先添加或选择一个游戏",
+                Language::EnUs => "Add or select a game first",
+            });
+            return;
+        };
+
+        let label = self.backup_label.trim().to_owned();
+        let label = if label.is_empty() {
+            None
+        } else {
+            Some(label.as_str())
+        };
+        match backup::create_backup(&self.config, &game, label, false, allow_empty) {
+            Ok(entry) => {
+                self.backup_label.clear();
+                self.selected_backup_path = Some(entry.path.clone());
+                self.refresh_backups();
+                self.status = match self.language() {
+                    Language::ZhCn => StatusMessage::success(format!(
+                        "备份完成：{} 个文件，{}",
+                        entry.file_count,
+                        format_size(entry.total_size)
+                    )),
+                    Language::EnUs => StatusMessage::success(format!(
+                        "Backup complete: {} files, {}",
+                        entry.file_count,
+                        format_size(entry.total_size)
+                    )),
+                };
+            }
+            Err(AppError::EmptySaveDir { .. }) if !allow_empty => {
+                self.confirm_action = Some(ConfirmAction::BackupEmptySaveDir { game_id: game.id });
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn restore_selected_backup(&mut self, backup_path: &PathBuf) {
+        let Some(game) = self.selected_game().cloned() else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择游戏",
+                Language::EnUs => "Select a game first",
+            });
+            return;
+        };
+        let Some(entry) = self
+            .backups
+            .iter()
+            .find(|item| &item.path == backup_path)
+            .cloned()
+        else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择有效备份",
+                Language::EnUs => "Select a valid backup first",
+            });
+            return;
+        };
+
+        match backup::restore_backup(&self.config, &game, &entry) {
+            Ok(pre_restore) => {
+                self.refresh_backups();
+                self.status = match self.language() {
+                    Language::ZhCn => StatusMessage::success(format!(
+                        "恢复完成，恢复前自动备份已保存到 {}",
+                        pre_restore.path.display()
+                    )),
+                    Language::EnUs => StatusMessage::success(format!(
+                        "Restore complete; safety backup saved to {}",
+                        pre_restore.path.display()
+                    )),
+                };
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn delete_selected_backup(&mut self, backup_path: &PathBuf) {
+        let Some(entry) = self
+            .backups
+            .iter()
+            .find(|item| &item.path == backup_path)
+            .cloned()
+        else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择有效备份",
+                Language::EnUs => "Select a valid backup first",
+            });
+            return;
+        };
+
+        match backup::delete_backup(&entry) {
+            Ok(()) => {
+                self.selected_backup_path = None;
+                self.refresh_backups();
+                self.status = StatusMessage::success(match self.language() {
+                    Language::ZhCn => "备份已删除",
+                    Language::EnUs => "Backup deleted",
+                });
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn delete_game(&mut self, game_id: &str) {
+        let Some(index) = self.config.games.iter().position(|game| game.id == game_id) else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "游戏配置不存在",
+                Language::EnUs => "Game config does not exist",
+            });
+            return;
+        };
+        let game = self.config.games[index].clone();
+
+        if self.delete_backups_with_game {
+            if let Err(err) = backup::delete_game_backup_dir(&self.config, &game) {
+                self.set_error(err);
+                return;
+            }
+        }
+
+        self.config.games.remove(index);
+        self.selected_game_id = self.config.games.first().map(|game| game.id.clone());
+        self.selected_backup_path = None;
+        self.delete_backups_with_game = false;
+        self.save_config();
+        self.refresh_backups();
+        self.status = StatusMessage::success(match self.language() {
+            Language::ZhCn => "游戏配置已删除",
+            Language::EnUs => "Game config deleted",
+        });
+    }
+
+    pub(crate) fn set_backup_root(&mut self, path: PathBuf) {
+        self.config.backup_root = path;
+        self.save_config();
+        self.refresh_backups();
+        self.status = StatusMessage::success(match self.language() {
+            Language::ZhCn => "备份根目录已更新",
+            Language::EnUs => "Backup root updated",
+        });
+    }
+
+    pub(crate) fn change_app_data_dir(&mut self, selected_dir: PathBuf) {
+        match config::migrate_app_data_dir(&selected_dir, &mut self.config) {
+            Ok(path) => {
+                self.refresh_backups();
+                self.status = match self.language() {
+                    Language::ZhCn => StatusMessage::success(format!(
+                        "数据目录已迁移到 {}，旧目录已删除",
+                        path.display()
+                    )),
+                    Language::EnUs => StatusMessage::success(format!(
+                        "Data folder moved to {}; old folder removed",
+                        path.display()
+                    )),
+                };
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn open_steam_scan_dialog(&mut self) {
+        match steam::scan_installed_games() {
+            Ok(candidates) => {
+                let state = SteamScanDialogState::from_candidates(candidates.clone());
+                self.steam_candidates = candidates;
+                self.selected_steam_app_id = state.selected_app_id.clone();
+                self.selected_steam_save_path = state.selected_save_path.clone();
+                self.steam_scan_state = Some(Arc::new(Mutex::new(state)));
+
+                if self.selected_steam_app_id.is_some() {
+                    self.status = match self.language() {
+                        Language::ZhCn => StatusMessage::success(format!(
+                            "已扫描到 {} 个 Steam 游戏",
+                            self.steam_candidates.len()
+                        )),
+                        Language::EnUs => StatusMessage::success(format!(
+                            "Found {} Steam games",
+                            self.steam_candidates.len()
+                        )),
+                    };
+                } else {
+                    self.selected_steam_app_id = None;
+                    self.selected_steam_save_path = None;
+                    self.status = StatusMessage::warning(match self.language() {
+                        Language::ZhCn => "未扫描到已安装的 Steam 游戏",
+                        Language::EnUs => "No installed Steam games found",
+                    });
+                }
+                self.show_steam_scan_dialog = true;
+            }
+            Err(err) => self.set_error(err),
+        }
+    }
+
+    pub(crate) fn selected_steam_candidate(&self) -> Option<&SteamGameCandidate> {
+        self.selected_steam_app_id.as_ref().and_then(|app_id| {
+            self.steam_candidates
+                .iter()
+                .find(|candidate| &candidate.app_id == app_id)
+        })
+    }
+
+    pub(crate) fn process_steam_scan_window_actions(&mut self) {
+        let Some(state_ref) = self.steam_scan_state.clone() else {
+            return;
+        };
+
+        let (snapshot, action) = match state_ref.lock() {
+            Ok(mut state) => {
+                let snapshot = state.clone();
+                let action = state.pending_action.take();
+                (snapshot, action)
+            }
+            Err(_) => {
+                self.close_steam_scan_dialog();
+                self.status = StatusMessage::error(match self.language() {
+                    Language::ZhCn => "Steam 扫描窗口状态异常，已关闭窗口",
+                    Language::EnUs => "Steam scan window state failed; window closed",
+                });
+                return;
+            }
+        };
+
+        self.steam_candidates = snapshot.candidates.clone();
+        self.selected_steam_app_id = snapshot.selected_app_id.clone();
+        self.selected_steam_save_path = snapshot.selected_save_path.clone();
+
+        match action {
+            Some(SteamScanAction::AddSelected { app_id, save_path }) => {
+                self.selected_steam_app_id = Some(app_id);
+                self.selected_steam_save_path = Some(save_path);
+                self.add_selected_steam_game();
+                if !self.show_steam_scan_dialog {
+                    self.steam_scan_state = None;
+                }
+            }
+            Some(SteamScanAction::AddAll) => {
+                self.add_all_steam_games_with_save_paths();
+            }
+            Some(SteamScanAction::Rescan) => {
+                self.open_steam_scan_dialog();
+            }
+            Some(SteamScanAction::Close) => {
+                self.close_steam_scan_dialog();
+            }
+            None if !snapshot.open => {
+                self.close_steam_scan_dialog();
+            }
+            None => {}
+        }
+    }
+
+    fn close_steam_scan_dialog(&mut self) {
+        self.show_steam_scan_dialog = false;
+        self.steam_scan_state = None;
+    }
+
+    pub(crate) fn add_selected_steam_game(&mut self) {
+        let Some(candidate) = self.selected_steam_candidate().cloned() else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择一个 Steam 游戏",
+                Language::EnUs => "Select a Steam game first",
+            });
+            return;
+        };
+        let Some(save_path) = self.selected_steam_save_path.clone() else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "请先选择或手动指定存档目录",
+                Language::EnUs => "Choose or manually set a save folder first",
+            });
+            return;
+        };
+        if self
+            .config
+            .games
+            .iter()
+            .any(|game| game.name == candidate.name)
+        {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "游戏列表中已存在同名游戏",
+                Language::EnUs => "A game with this name already exists",
+            });
+            return;
+        }
+
+        let game = GameConfig {
+            id: Uuid::new_v4().to_string(),
+            name: candidate.name.clone(),
+            save_path,
+            max_backups: Some(20),
+            auto_cleanup_enabled: true,
+        };
+
+        self.selected_game_id = Some(game.id.clone());
+        self.selected_backup_path = None;
+        self.backup_label.clear();
+        self.config.games.push(game);
+        self.show_steam_scan_dialog = false;
+        self.save_config();
+        self.refresh_backups();
+        self.status = match self.language() {
+            Language::ZhCn => {
+                StatusMessage::success(format!("已加入 Steam 游戏：{}", candidate.name))
+            }
+            Language::EnUs => {
+                StatusMessage::success(format!("Added Steam game: {}", candidate.name))
+            }
+        };
+    }
+
+    pub(crate) fn add_all_steam_games_with_save_paths(&mut self) {
+        let mut added = 0usize;
+        let mut skipped_duplicates = 0usize;
+        let mut skipped_without_path = 0usize;
+
+        for candidate in self.steam_candidates.clone() {
+            if self
+                .config
+                .games
+                .iter()
+                .any(|game| game.name == candidate.name)
+            {
+                skipped_duplicates += 1;
+                continue;
+            }
+
+            let Some(save_path) = candidate.recommended_save_path() else {
+                skipped_without_path += 1;
+                continue;
+            };
+
+            let game = GameConfig {
+                id: Uuid::new_v4().to_string(),
+                name: candidate.name,
+                save_path,
+                max_backups: Some(20),
+                auto_cleanup_enabled: true,
+            };
+
+            self.selected_game_id = Some(game.id.clone());
+            self.config.games.push(game);
+            added += 1;
+        }
+
+        if added > 0 {
+            self.selected_backup_path = None;
+            self.backup_label.clear();
+            self.save_config();
+            self.refresh_backups();
+            self.status = match self.language() {
+                Language::ZhCn => StatusMessage::success(format!(
+                    "已加入 {added} 个 Steam 游戏；跳过 {skipped_duplicates} 个已存在，{skipped_without_path} 个无候选目录"
+                )),
+                Language::EnUs => StatusMessage::success(format!(
+                    "Added {added} Steam games; skipped {skipped_duplicates} existing, {skipped_without_path} without candidates"
+                )),
+            };
+        } else {
+            self.status = match self.language() {
+                Language::ZhCn => StatusMessage::warning(format!(
+                    "没有可批量加入的游戏；跳过 {skipped_duplicates} 个已存在，{skipped_without_path} 个无候选目录"
+                )),
+                Language::EnUs => StatusMessage::warning(format!(
+                    "No games to batch add; skipped {skipped_duplicates} existing, {skipped_without_path} without candidates"
+                )),
+            };
+        }
+    }
+
+    pub(crate) fn set_error(&mut self, err: AppError) {
+        let message = err.user_message();
+        logger::error(&message);
+        self.status = StatusMessage::error(message);
+    }
+
+    pub(crate) fn open_path(&mut self, path: PathBuf) {
+        match opener::open(&path) {
+            Ok(()) => {}
+            Err(err) => {
+                self.status = match self.language() {
+                    Language::ZhCn => {
+                        StatusMessage::error(format!("打开目录失败: {} ({err})", path.display()))
+                    }
+                    Language::EnUs => StatusMessage::error(format!(
+                        "Open folder failed: {} ({err})",
+                        path.display()
+                    )),
+                };
+            }
+        }
+    }
+
+    pub(crate) fn open_user_guide(&mut self) {
+        if let Some(state_ref) = &self.help_window_state {
+            if let Ok(mut state) = state_ref.lock() {
+                state.open = true;
+            }
+        } else {
+            self.help_window_state = Some(Arc::new(Mutex::new(HelpWindowState::new())));
+        }
+        self.status = StatusMessage::success(self.text(T::HelpOpened));
+    }
+
+    pub(crate) fn handle_root_viewport(&mut self, ctx: &egui::Context) {
+        self.remember_window_settings(ctx);
+
+        if tray::take_exit_requested() {
+            self.force_exit_requested = true;
+            self.show_close_behavior_dialog = false;
+            self.show_steam_scan_dialog = false;
+            self.steam_scan_state = None;
+            self.help_window_state = None;
+            self.save_config();
+            tray::shutdown();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.remember_window_settings(ctx);
+            if self.force_exit_requested {
+                self.save_config();
+                tray::shutdown();
+                return;
+            }
+
+            if !self.config.settings.close_behavior_prompted {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_close_behavior_dialog = true;
+                return;
+            }
+
+            match self.config.settings.close_behavior {
+                CloseBehavior::MinimizeToTray => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.hide_to_tray();
+                }
+                CloseBehavior::Exit => {
+                    self.save_config();
+                    tray::shutdown();
+                }
+            }
+        }
+    }
+
+    fn remember_window_settings(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.input(|input| input.viewport().clone());
+        if viewport.minimized == Some(true) {
+            return;
+        }
+
+        let mut changed = false;
+        if let Some(maximized) = viewport.maximized {
+            if self.config.settings.main_window.maximized != maximized {
+                self.config.settings.main_window.maximized = maximized;
+                changed = true;
+            }
+        }
+
+        if let Some(rect) = viewport.inner_rect {
+            let size = rect.size();
+            if size.x >= MAIN_WINDOW_MIN_WIDTH && size.y >= MAIN_WINDOW_MIN_HEIGHT {
+                let old_width = self.config.settings.main_window.width.unwrap_or_default();
+                let old_height = self.config.settings.main_window.height.unwrap_or_default();
+                if (old_width - size.x).abs() > 1.0 || (old_height - size.y).abs() > 1.0 {
+                    self.config.settings.main_window.width = Some(size.x);
+                    self.config.settings.main_window.height = Some(size.y);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed && self.last_window_settings_save.elapsed() >= Duration::from_millis(800) {
+            self.last_window_settings_save = Instant::now();
+            self.save_config();
+        }
+    }
+
+    pub(crate) fn hide_to_tray(&mut self) {
+        self.save_config();
+        if let Some(hwnd) = self.main_hwnd {
+            tray::hide_window(hwnd);
+            self.status = StatusMessage::info(match self.language() {
+                Language::ZhCn => "已最小化到系统托盘，双击托盘图标可恢复窗口",
+                Language::EnUs => "Minimized to tray; double-click the tray icon to restore",
+            });
+        } else {
+            self.status = StatusMessage::warning(match self.language() {
+                Language::ZhCn => "当前环境无法创建系统托盘，已保持窗口显示",
+                Language::EnUs => "System tray is unavailable; keeping the window visible",
+            });
+        }
+    }
+
+    pub(crate) fn choose_close_behavior(&mut self, behavior: CloseBehavior, ctx: &egui::Context) {
+        self.config.settings.close_behavior = behavior;
+        self.config.settings.close_behavior_prompted = true;
+        self.save_config();
+
+        match behavior {
+            CloseBehavior::MinimizeToTray => {
+                self.show_close_behavior_dialog = false;
+                self.hide_to_tray();
+            }
+            CloseBehavior::Exit => {
+                self.show_close_behavior_dialog = false;
+                tray::shutdown();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+}
+
+impl eframe::App for GameSaveApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_embed_viewports(false);
+        self.handle_root_viewport(ctx);
+        self.process_steam_scan_window_actions();
+        self.draw_game_list(ctx);
+        self.draw_main_panel(ctx);
+        self.draw_status_bar(ctx);
+        self.draw_game_dialog(ctx);
+        self.draw_steam_scan_dialog(ctx);
+        self.draw_confirmation_dialog(ctx);
+        self.draw_close_behavior_dialog(ctx);
+        self.draw_help_window(ctx);
+        self.process_steam_scan_window_actions();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_config();
+        tray::shutdown();
+    }
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let font_candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ];
+
+    for path in font_candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "windows_chinese".to_owned(),
+                egui::FontData::from_owned(bytes),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "windows_chinese".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "windows_chinese".to_owned());
+            ctx.set_fonts(fonts);
+            break;
+        }
+    }
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    ctx.set_style(style);
+}
+
+pub(crate) fn status_color(kind: StatusKind, visuals: &egui::Visuals) -> egui::Color32 {
+    match kind {
+        StatusKind::Info => visuals.text_color(),
+        StatusKind::Success => egui::Color32::from_rgb(36, 128, 72),
+        StatusKind::Warning => egui::Color32::from_rgb(166, 116, 20),
+        StatusKind::Error => egui::Color32::from_rgb(180, 48, 48),
+    }
+}
