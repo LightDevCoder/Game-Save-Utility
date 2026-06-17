@@ -1,16 +1,20 @@
-use crate::backup;
 use crate::config;
 use crate::fs_utils::format_size;
 use crate::i18n::{t, Text as T};
 use crate::logger;
 use crate::models::{
-    AppConfig, AppError, AppResult, BackupEntry, CloseBehavior, GameConfig, Language, PresetGame,
-    StatusKind, StatusMessage, MAIN_WINDOW_MIN_HEIGHT, MAIN_WINDOW_MIN_WIDTH,
+    AppConfig, AppError, AppResult, AutoBackupConfig, AutoBackupIntervalUnit, BackupEntry,
+    BackupStorageMode, CloseBehavior, GameConfig, Language, PresetGame, StatusKind, StatusMessage,
+    SteamLink, MAIN_WINDOW_MIN_HEIGHT, MAIN_WINDOW_MIN_WIDTH,
 };
 use crate::presets;
+use crate::scheduler::BackgroundBackupDecision;
 use crate::steam::{self, SteamGameCandidate};
 use crate::tray;
+use crate::{backup, cloud, scheduler};
+use chrono::Local;
 use eframe::egui;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,14 +26,25 @@ pub(crate) struct GameForm {
     pub save_path: String,
     pub max_backups: String,
     pub auto_cleanup_enabled: bool,
+    pub backup_storage_mode: BackupStorageMode,
+    pub auto_backup_enabled: bool,
+    pub auto_backup_interval_value: String,
+    pub auto_backup_interval_unit: AutoBackupIntervalUnit,
+    pub change_reminder_enabled: bool,
     pub preset_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActiveList {
+    Games,
+    Backups,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ConfirmAction {
     BackupEmptySaveDir { game_id: String },
     RestoreBackup { backup_path: PathBuf },
-    DeleteBackup { backup_path: PathBuf },
+    DeleteBackups { backup_paths: Vec<PathBuf> },
     DeleteGame { game_id: String },
 }
 
@@ -115,6 +130,9 @@ pub struct GameSaveApp {
     pub(crate) selected_game_id: Option<String>,
     pub(crate) backups: Vec<BackupEntry>,
     pub(crate) selected_backup_path: Option<PathBuf>,
+    pub(crate) selected_backup_paths: BTreeSet<PathBuf>,
+    pub(crate) backup_delete_selection_mode: bool,
+    pub(crate) active_list: ActiveList,
     pub(crate) backup_label: String,
     pub(crate) status: StatusMessage,
     pub(crate) presets: Vec<PresetGame>,
@@ -131,9 +149,11 @@ pub struct GameSaveApp {
     pub(crate) app_icon: Option<Arc<egui::IconData>>,
     pub(crate) main_hwnd: Option<tray::WindowHandle>,
     pub(crate) show_close_behavior_dialog: bool,
+    pub(crate) show_shortcut_settings_dialog: bool,
     pub(crate) help_window_state: Option<Arc<Mutex<HelpWindowState>>>,
     pub(crate) force_exit_requested: bool,
     pub(crate) last_window_settings_save: Instant,
+    pub(crate) last_background_check: Instant,
 }
 
 impl GameSaveApp {
@@ -193,6 +213,9 @@ impl GameSaveApp {
             selected_game_id,
             backups: Vec::new(),
             selected_backup_path: None,
+            selected_backup_paths: BTreeSet::new(),
+            backup_delete_selection_mode: false,
+            active_list: ActiveList::Games,
             backup_label: String::new(),
             status,
             presets: presets::built_in_presets(),
@@ -209,9 +232,11 @@ impl GameSaveApp {
             app_icon,
             main_hwnd,
             show_close_behavior_dialog: false,
+            show_shortcut_settings_dialog: false,
             help_window_state: None,
             force_exit_requested: false,
             last_window_settings_save: Instant::now(),
+            last_background_check: Instant::now(),
         };
         app.refresh_backups();
         app
@@ -243,7 +268,10 @@ impl GameSaveApp {
 
     pub(crate) fn select_game(&mut self, game_id: String) {
         self.selected_game_id = Some(game_id);
+        self.active_list = ActiveList::Games;
         self.selected_backup_path = None;
+        self.selected_backup_paths.clear();
+        self.backup_delete_selection_mode = false;
         self.backup_label.clear();
         self.refresh_backups();
     }
@@ -252,26 +280,87 @@ impl GameSaveApp {
         let Some(game) = self.selected_game().cloned() else {
             self.backups.clear();
             self.selected_backup_path = None;
+            self.selected_backup_paths.clear();
+            self.backup_delete_selection_mode = false;
             return;
         };
 
         match backup::scan_backups(&self.config, &game) {
             Ok(backups) => {
                 self.backups = backups;
-                if let Some(selected_path) = &self.selected_backup_path {
-                    if !self
-                        .backups
-                        .iter()
-                        .any(|entry| &entry.path == selected_path)
-                    {
-                        self.selected_backup_path = None;
-                    }
-                }
+                self.selected_backup_paths
+                    .retain(|path| self.backups.iter().any(|entry| &entry.path == path));
+                self.sync_primary_backup_selection();
             }
             Err(err) => {
                 self.backups.clear();
                 self.selected_backup_path = None;
+                self.selected_backup_paths.clear();
+                self.backup_delete_selection_mode = false;
                 self.set_error(err);
+            }
+        }
+    }
+
+    pub(crate) fn single_selected_backup_path(&self) -> Option<PathBuf> {
+        self.selected_backup_path.clone()
+    }
+
+    pub(crate) fn select_single_backup(&mut self, backup_path: PathBuf) {
+        self.active_list = ActiveList::Backups;
+        self.selected_backup_path = Some(backup_path);
+    }
+
+    pub(crate) fn set_backup_delete_selected(&mut self, backup_path: PathBuf, selected: bool) {
+        self.active_list = ActiveList::Backups;
+        self.backup_delete_selection_mode = true;
+        if selected {
+            self.selected_backup_paths.insert(backup_path);
+        } else {
+            self.selected_backup_paths.remove(&backup_path);
+        }
+    }
+
+    pub(crate) fn all_backups_selected_for_delete(&self) -> bool {
+        !self.backups.is_empty()
+            && self.selected_backup_paths.len() == self.backups.len()
+            && self
+                .backups
+                .iter()
+                .all(|entry| self.selected_backup_paths.contains(&entry.path))
+    }
+
+    pub(crate) fn select_all_backups_for_delete(&mut self) {
+        self.active_list = ActiveList::Backups;
+        self.backup_delete_selection_mode = true;
+        self.selected_backup_paths = self
+            .backups
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+    }
+
+    pub(crate) fn clear_backup_delete_selection(&mut self) {
+        self.active_list = ActiveList::Backups;
+        self.selected_backup_paths.clear();
+    }
+
+    pub(crate) fn toggle_backup_delete_selection_mode(&mut self) {
+        self.active_list = ActiveList::Backups;
+        self.backup_delete_selection_mode = !self.backup_delete_selection_mode;
+        if !self.backup_delete_selection_mode {
+            self.selected_backup_paths.clear();
+        }
+    }
+
+    fn sync_primary_backup_selection(&mut self) {
+        if let Some(selected_path) = &self.selected_backup_path {
+            if !self
+                .backups
+                .iter()
+                .any(|entry| &entry.path == selected_path)
+            {
+                self.selected_backup_path = None;
             }
         }
     }
@@ -293,6 +382,11 @@ impl GameSaveApp {
         self.game_form = GameForm {
             max_backups: "20".to_owned(),
             auto_cleanup_enabled: true,
+            backup_storage_mode: BackupStorageMode::Incremental,
+            auto_backup_enabled: false,
+            auto_backup_interval_value: "24".to_owned(),
+            auto_backup_interval_unit: AutoBackupIntervalUnit::Hours,
+            change_reminder_enabled: true,
             ..Default::default()
         };
         self.show_game_dialog = true;
@@ -316,6 +410,11 @@ impl GameSaveApp {
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
             auto_cleanup_enabled: game.auto_cleanup_enabled,
+            backup_storage_mode: game.backup_storage_mode,
+            auto_backup_enabled: game.auto_backup.enabled,
+            auto_backup_interval_value: game.auto_backup.display_interval_value().to_string(),
+            auto_backup_interval_unit: game.auto_backup.display_interval_unit(),
+            change_reminder_enabled: game.auto_backup.change_reminder_enabled,
             preset_index: None,
         };
         self.show_game_dialog = true;
@@ -324,8 +423,10 @@ impl GameSaveApp {
     pub(crate) fn submit_game_form(&mut self) {
         match self.build_game_from_form() {
             Ok(mut game) => {
+                let saved_game_id;
                 if let Some(editing_id) = self.editing_game_id.clone() {
                     game.id = editing_id.clone();
+                    saved_game_id = editing_id.clone();
                     if let Some(existing) = self
                         .config
                         .games
@@ -336,11 +437,17 @@ impl GameSaveApp {
                     }
                 } else {
                     self.selected_game_id = Some(game.id.clone());
+                    saved_game_id = game.id.clone();
+                    self.selected_backup_path = None;
+                    self.selected_backup_paths.clear();
+                    self.backup_delete_selection_mode = false;
                     self.config.games.push(game);
                 }
 
+                self.schedule_game_auto_backup_from_now(&saved_game_id);
                 self.show_game_dialog = false;
                 self.save_config();
+                self.schedule_background_check_now();
                 self.refresh_backups();
                 self.status = StatusMessage::success(match self.language() {
                     Language::ZhCn => "游戏配置已保存",
@@ -403,12 +510,76 @@ impl GameSaveApp {
             Some(value)
         };
 
+        let auto_backup_interval_value = self
+            .game_form
+            .auto_backup_interval_value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| {
+                AppError::message(match self.language() {
+                    Language::ZhCn => "自动备份间隔必须是正整数",
+                    Language::EnUs => "Auto backup interval must be a positive integer",
+                })
+            })?;
+        if auto_backup_interval_value == 0 {
+            return Err(AppError::message(match self.language() {
+                Language::ZhCn => "自动备份间隔不能为 0",
+                Language::EnUs => "Auto backup interval cannot be 0",
+            }));
+        }
+        let auto_backup_interval_minutes = match self.game_form.auto_backup_interval_unit {
+            AutoBackupIntervalUnit::Minutes => auto_backup_interval_value,
+            AutoBackupIntervalUnit::Hours => {
+                auto_backup_interval_value.checked_mul(60).ok_or_else(|| {
+                    AppError::message(match self.language() {
+                        Language::ZhCn => "自动备份间隔过大",
+                        Language::EnUs => "Auto backup interval is too large",
+                    })
+                })?
+            }
+        };
+        let auto_backup_interval_hours = auto_backup_interval_minutes.div_ceil(60).max(1);
+
         Ok(GameConfig {
             id: Uuid::new_v4().to_string(),
             name: name.to_owned(),
             save_path: PathBuf::from(save_path),
             max_backups,
             auto_cleanup_enabled: self.game_form.auto_cleanup_enabled,
+            backup_storage_mode: self.game_form.backup_storage_mode,
+            steam_link: self
+                .editing_game_id
+                .as_ref()
+                .and_then(|editing_id| self.config.games.iter().find(|game| &game.id == editing_id))
+                .and_then(|game| game.steam_link.clone()),
+            auto_backup: AutoBackupConfig {
+                enabled: self.game_form.auto_backup_enabled,
+                interval_hours: auto_backup_interval_hours,
+                interval_minutes: Some(auto_backup_interval_minutes),
+                interval_unit: self.game_form.auto_backup_interval_unit,
+                change_reminder_enabled: self.game_form.change_reminder_enabled,
+                last_auto_backup_at: self
+                    .editing_game_id
+                    .as_ref()
+                    .and_then(|editing_id| {
+                        self.config.games.iter().find(|game| &game.id == editing_id)
+                    })
+                    .and_then(|game| game.auto_backup.last_auto_backup_at.clone()),
+                last_reminded_snapshot_hash: self
+                    .editing_game_id
+                    .as_ref()
+                    .and_then(|editing_id| {
+                        self.config.games.iter().find(|game| &game.id == editing_id)
+                    })
+                    .and_then(|game| game.auto_backup.last_reminded_snapshot_hash.clone()),
+                next_auto_backup_at: self
+                    .editing_game_id
+                    .as_ref()
+                    .and_then(|editing_id| {
+                        self.config.games.iter().find(|game| &game.id == editing_id)
+                    })
+                    .and_then(|game| game.auto_backup.next_auto_backup_at.clone()),
+            },
         })
     }
 
@@ -427,22 +598,20 @@ impl GameSaveApp {
         } else {
             Some(label.as_str())
         };
+        let cloud_warning = self.cloud_conflict_warning(&game);
         match backup::create_backup(&self.config, &game, label, false, allow_empty) {
             Ok(entry) => {
                 self.backup_label.clear();
                 self.selected_backup_path = Some(entry.path.clone());
+                self.selected_backup_paths.clear();
+                self.backup_delete_selection_mode = false;
+                self.sync_auto_backup_after_manual_backup(&game.id);
                 self.refresh_backups();
-                self.status = match self.language() {
-                    Language::ZhCn => StatusMessage::success(format!(
-                        "备份完成：{} 个文件，{}",
-                        entry.file_count,
-                        format_size(entry.total_size)
-                    )),
-                    Language::EnUs => StatusMessage::success(format!(
-                        "Backup complete: {} files, {}",
-                        entry.file_count,
-                        format_size(entry.total_size)
-                    )),
+                let message = self.backup_complete_message(&entry);
+                self.status = if let Some(warning) = cloud_warning {
+                    StatusMessage::warning(format!("{message}; {warning}"))
+                } else {
+                    StatusMessage::success(message)
                 };
             }
             Err(AppError::EmptySaveDir { .. }) if !allow_empty => {
@@ -473,49 +642,77 @@ impl GameSaveApp {
             return;
         };
 
+        let cloud_warning = self.cloud_conflict_warning(&game);
         match backup::restore_backup(&self.config, &game, &entry) {
             Ok(pre_restore) => {
                 self.refresh_backups();
-                self.status = match self.language() {
-                    Language::ZhCn => StatusMessage::success(format!(
+                let message = match self.language() {
+                    Language::ZhCn => format!(
                         "恢复完成，恢复前自动备份已保存到 {}",
                         pre_restore.path.display()
-                    )),
-                    Language::EnUs => StatusMessage::success(format!(
+                    ),
+                    Language::EnUs => format!(
                         "Restore complete; safety backup saved to {}",
                         pre_restore.path.display()
-                    )),
+                    ),
+                };
+                self.status = if let Some(warning) = cloud_warning {
+                    StatusMessage::warning(format!("{message}; {warning}"))
+                } else {
+                    StatusMessage::success(message)
                 };
             }
             Err(err) => self.set_error(err),
         }
     }
 
-    pub(crate) fn delete_selected_backup(&mut self, backup_path: &PathBuf) {
-        let Some(entry) = self
+    pub(crate) fn delete_selected_backups(&mut self, backup_paths: &[PathBuf]) {
+        let requested: BTreeSet<PathBuf> = backup_paths.iter().cloned().collect();
+        let entries: Vec<BackupEntry> = self
             .backups
             .iter()
-            .find(|item| &item.path == backup_path)
+            .filter(|item| requested.contains(&item.path))
             .cloned()
-        else {
+            .collect();
+
+        if entries.is_empty() {
             self.status = StatusMessage::warning(match self.language() {
                 Language::ZhCn => "请先选择有效备份",
                 Language::EnUs => "Select a valid backup first",
             });
             return;
-        };
-
-        match backup::delete_backup(&entry) {
-            Ok(()) => {
-                self.selected_backup_path = None;
-                self.refresh_backups();
-                self.status = StatusMessage::success(match self.language() {
-                    Language::ZhCn => "备份已删除",
-                    Language::EnUs => "Backup deleted",
-                });
-            }
-            Err(err) => self.set_error(err),
         }
+
+        let mut deleted = 0usize;
+        for entry in entries {
+            if let Err(err) = backup::delete_backup(&entry) {
+                self.set_error(err);
+                self.refresh_backups();
+                return;
+            }
+            deleted += 1;
+        }
+
+        self.selected_backup_path = None;
+        self.selected_backup_paths.clear();
+        self.backup_delete_selection_mode = false;
+        self.refresh_backups();
+        self.status = StatusMessage::success(match self.language() {
+            Language::ZhCn => {
+                if deleted == 1 {
+                    "备份已删除".to_owned()
+                } else {
+                    format!("已删除 {deleted} 个备份")
+                }
+            }
+            Language::EnUs => {
+                if deleted == 1 {
+                    "Backup deleted".to_owned()
+                } else {
+                    format!("Deleted {deleted} backups")
+                }
+            }
+        });
     }
 
     pub(crate) fn delete_game(&mut self, game_id: &str) {
@@ -538,6 +735,8 @@ impl GameSaveApp {
         self.config.games.remove(index);
         self.selected_game_id = self.config.games.first().map(|game| game.id.clone());
         self.selected_backup_path = None;
+        self.selected_backup_paths.clear();
+        self.backup_delete_selection_mode = false;
         self.delete_backups_with_game = false;
         self.save_config();
         self.refresh_backups();
@@ -548,13 +747,23 @@ impl GameSaveApp {
     }
 
     pub(crate) fn set_backup_root(&mut self, path: PathBuf) {
+        let old_backup_root = self.config.backup_root.clone();
         self.config.backup_root = path;
-        self.save_config();
-        self.refresh_backups();
-        self.status = StatusMessage::success(match self.language() {
-            Language::ZhCn => "备份根目录已更新",
-            Language::EnUs => "Backup root updated",
-        });
+        match config::save_config(&self.config) {
+            Ok(()) => {
+                logger::info("备份根目录保存完成");
+                self.refresh_backups();
+                self.status = StatusMessage::success(match self.language() {
+                    Language::ZhCn => "备份根目录已更新",
+                    Language::EnUs => "Backup root updated",
+                });
+            }
+            Err(err) => {
+                self.config.backup_root = old_backup_root;
+                logger::error(format!("备份根目录保存失败: {}", err.user_message()));
+                self.set_error(err);
+            }
+        }
     }
 
     pub(crate) fn change_app_data_dir(&mut self, selected_dir: PathBuf) {
@@ -707,10 +916,15 @@ impl GameSaveApp {
             save_path,
             max_backups: Some(20),
             auto_cleanup_enabled: true,
+            backup_storage_mode: BackupStorageMode::Incremental,
+            steam_link: Some(steam_link_from_candidate(&candidate)),
+            auto_backup: Default::default(),
         };
 
         self.selected_game_id = Some(game.id.clone());
         self.selected_backup_path = None;
+        self.selected_backup_paths.clear();
+        self.backup_delete_selection_mode = false;
         self.backup_label.clear();
         self.config.games.push(game);
         self.show_steam_scan_dialog = false;
@@ -749,10 +963,13 @@ impl GameSaveApp {
 
             let game = GameConfig {
                 id: Uuid::new_v4().to_string(),
-                name: candidate.name,
+                name: candidate.name.clone(),
                 save_path,
                 max_backups: Some(20),
                 auto_cleanup_enabled: true,
+                backup_storage_mode: BackupStorageMode::Incremental,
+                steam_link: Some(steam_link_from_candidate(&candidate)),
+                auto_backup: Default::default(),
             };
 
             self.selected_game_id = Some(game.id.clone());
@@ -762,6 +979,8 @@ impl GameSaveApp {
 
         if added > 0 {
             self.selected_backup_path = None;
+            self.selected_backup_paths.clear();
+            self.backup_delete_selection_mode = false;
             self.backup_label.clear();
             self.save_config();
             self.refresh_backups();
@@ -819,6 +1038,292 @@ impl GameSaveApp {
         self.status = StatusMessage::success(self.text(T::HelpOpened));
     }
 
+    pub(crate) fn open_shortcut_settings(&mut self) {
+        self.show_shortcut_settings_dialog = true;
+        self.status = StatusMessage::success(self.text(T::ShortcutSettingsOpened));
+    }
+
+    pub(crate) fn backup_complete_message(&self, entry: &BackupEntry) -> String {
+        let stored = entry
+            .stored_size
+            .map(format_size)
+            .unwrap_or_else(|| format_size(entry.total_size));
+        match self.language() {
+            Language::ZhCn => format!(
+                "备份完成：{} 个文件，原始大小 {}，存储大小 {}",
+                entry.file_count,
+                format_size(entry.total_size),
+                stored
+            ),
+            Language::EnUs => format!(
+                "Backup complete: {} files, source {}, stored {}",
+                entry.file_count,
+                format_size(entry.total_size),
+                stored
+            ),
+        }
+    }
+
+    pub(crate) fn cloud_conflict_warning(&self, game: &GameConfig) -> Option<String> {
+        match cloud::check_steam_cloud_conflict(game) {
+            Ok(Some(conflict)) => Some(match self.language() {
+                Language::ZhCn => format!(
+                    "Steam Cloud 本地缓存与存档目录的最新修改时间不一致，请确认是否存在云同步冲突: {}",
+                    conflict.cloud_path.display()
+                ),
+                Language::EnUs => format!(
+                    "Steam Cloud local cache has a different latest modified time; check for sync conflicts: {}",
+                    conflict.cloud_path.display()
+                ),
+            }),
+            Ok(None) => None,
+            Err(err) => Some(match self.language() {
+                Language::ZhCn => format!("Steam Cloud 冲突检测失败: {}", err.user_message()),
+                Language::EnUs => format!("Steam Cloud conflict check failed: {}", err.user_message()),
+            }),
+        }
+    }
+
+    pub(crate) fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if !self.config.settings.keyboard_shortcuts_enabled {
+            return;
+        }
+
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        if ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::S,
+            ))
+        }) {
+            self.start_backup(false);
+        }
+
+        if ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::R,
+            ))
+        }) {
+            if let Some(path) = self.single_selected_backup_path() {
+                self.confirm_action = Some(ConfirmAction::RestoreBackup { backup_path: path });
+            }
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.navigate_active_list(1);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.navigate_active_list(-1);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
+            self.active_list = ActiveList::Games;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
+            if !self.backups.is_empty() {
+                self.active_list = ActiveList::Backups;
+            }
+        }
+    }
+
+    fn navigate_active_list(&mut self, delta: isize) {
+        match self.active_list {
+            ActiveList::Games => {
+                if self.config.games.is_empty() {
+                    return;
+                }
+                let current = self
+                    .selected_game_id
+                    .as_ref()
+                    .and_then(|id| self.config.games.iter().position(|game| &game.id == id))
+                    .unwrap_or(0);
+                let next = offset_index(current, self.config.games.len(), delta);
+                let game_id = self.config.games[next].id.clone();
+                self.select_game(game_id);
+            }
+            ActiveList::Backups => {
+                if self.backups.is_empty() {
+                    return;
+                }
+                let current = self
+                    .selected_backup_path
+                    .as_ref()
+                    .and_then(|path| self.backups.iter().position(|entry| &entry.path == path))
+                    .unwrap_or(0);
+                let next = offset_index(current, self.backups.len(), delta);
+                self.select_single_backup(self.backups[next].path.clone());
+            }
+        }
+    }
+
+    pub(crate) fn run_background_checks(&mut self) {
+        if self.last_background_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_background_check = Instant::now();
+
+        let mut config_changed = false;
+        let game_ids: Vec<String> = self
+            .config
+            .games
+            .iter()
+            .map(|game| game.id.clone())
+            .collect();
+        for game_id in game_ids {
+            let Some(game) = self
+                .config
+                .games
+                .iter()
+                .find(|game| game.id == game_id)
+                .cloned()
+            else {
+                continue;
+            };
+
+            let change_state = match scheduler::backup_change_state(&self.config, &game) {
+                Ok(state) => state,
+                Err(err) => {
+                    logger::warn(format!(
+                        "Background save change check failed for {}: {}",
+                        game.name,
+                        err.user_message()
+                    ));
+                    if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
+                        self.status = StatusMessage::warning(match self.language() {
+                            Language::ZhCn => {
+                                format!("自动备份检查失败：{}", err.user_message())
+                            }
+                            Language::EnUs => {
+                                format!("Automatic backup check failed: {}", err.user_message())
+                            }
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            match scheduler::background_backup_decision(&game, &change_state, Local::now()) {
+                BackgroundBackupDecision::AutoBackup { snapshot_hash } => {
+                    let backup_result = backup::create_backup(
+                        &self.config,
+                        &game,
+                        Some("Automatic backup"),
+                        false,
+                        false,
+                    );
+
+                    match backup_result {
+                        Ok(entry) => {
+                            if let Some(game) =
+                                self.config.games.iter_mut().find(|game| game.id == game_id)
+                            {
+                                let now = Local::now();
+                                game.auto_backup.last_auto_backup_at = Some(now.to_rfc3339());
+                                if let Some(snapshot_hash) = &snapshot_hash {
+                                    game.auto_backup.last_reminded_snapshot_hash =
+                                        Some(snapshot_hash.clone());
+                                }
+                                game.auto_backup.next_auto_backup_at =
+                                    scheduler::next_auto_backup_time_string(game, now);
+                            }
+                            config_changed = true;
+                            self.refresh_backups();
+                            self.status =
+                                StatusMessage::success(self.backup_complete_message(&entry));
+                        }
+                        Err(err) => {
+                            logger::warn(format!(
+                                "Automatic backup failed for {}: {}",
+                                game.name,
+                                err.user_message()
+                            ));
+                            if let Some(game) =
+                                self.config.games.iter_mut().find(|game| game.id == game_id)
+                            {
+                                game.auto_backup.next_auto_backup_at =
+                                    scheduler::next_auto_backup_time_string(game, Local::now());
+                            }
+                            config_changed = true;
+                            if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
+                                let message = err.user_message();
+                                self.status = StatusMessage::warning(match self.language() {
+                                    Language::ZhCn => format!("自动备份失败：{message}"),
+                                    Language::EnUs => format!("Automatic backup failed: {message}"),
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                BackgroundBackupDecision::Remind { snapshot_hash } => {
+                    if let Some(game) = self.config.games.iter_mut().find(|game| game.id == game_id)
+                    {
+                        game.auto_backup.last_reminded_snapshot_hash = Some(snapshot_hash);
+                    }
+                    config_changed = true;
+                    if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
+                        self.status = StatusMessage::warning(match self.language() {
+                            Language::ZhCn => "检测到存档有未备份变更".to_owned(),
+                            Language::EnUs => {
+                                "Detected save changes that have not been backed up".to_owned()
+                            }
+                        });
+                    }
+                }
+                BackgroundBackupDecision::AdvanceTimer => {
+                    if let Some(game) = self.config.games.iter_mut().find(|game| game.id == game_id)
+                    {
+                        game.auto_backup.next_auto_backup_at =
+                            scheduler::next_auto_backup_time_string(game, Local::now());
+                    }
+                    config_changed = true;
+                    if matches!(change_state, scheduler::BackupChangeState::NoSaveFolder)
+                        && self.selected_game_id.as_deref() == Some(game_id.as_str())
+                    {
+                        self.status = StatusMessage::warning(match self.language() {
+                            Language::ZhCn => "自动备份跳过：存档目录不存在".to_owned(),
+                            Language::EnUs => {
+                                "Automatic backup skipped: save folder does not exist".to_owned()
+                            }
+                        });
+                    }
+                }
+                BackgroundBackupDecision::Skip => {}
+            }
+        }
+
+        if config_changed {
+            self.save_config();
+        }
+    }
+
+    pub(crate) fn schedule_background_check_now(&mut self) {
+        self.last_background_check = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(Instant::now);
+    }
+
+    pub(crate) fn sync_auto_backup_after_manual_backup(&mut self, game_id: &str) {
+        if let Some(game) = self.config.games.iter_mut().find(|game| game.id == game_id) {
+            let now = Local::now();
+            game.auto_backup.last_auto_backup_at = Some(now.to_rfc3339());
+            game.auto_backup.last_reminded_snapshot_hash = None;
+            game.auto_backup.next_auto_backup_at =
+                scheduler::next_auto_backup_time_string(game, now);
+            self.save_config();
+        }
+    }
+
+    pub(crate) fn schedule_game_auto_backup_from_now(&mut self, game_id: &str) {
+        if let Some(game) = self.config.games.iter_mut().find(|game| game.id == game_id) {
+            game.auto_backup.next_auto_backup_at =
+                scheduler::next_auto_backup_time_string(game, Local::now());
+        }
+    }
+
     pub(crate) fn handle_root_viewport(&mut self, ctx: &egui::Context) {
         self.remember_window_settings(ctx);
 
@@ -827,6 +1332,7 @@ impl GameSaveApp {
             self.show_close_behavior_dialog = false;
             self.show_steam_scan_dialog = false;
             self.steam_scan_state = None;
+            self.show_shortcut_settings_dialog = false;
             self.help_window_state = None;
             self.save_config();
             tray::shutdown();
@@ -932,15 +1438,26 @@ impl GameSaveApp {
 impl eframe::App for GameSaveApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_embed_viewports(false);
+        if self
+            .config
+            .games
+            .iter()
+            .any(|game| game.auto_backup.enabled || game.auto_backup.change_reminder_enabled)
+        {
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
         self.handle_root_viewport(ctx);
+        self.handle_keyboard_shortcuts(ctx);
+        self.run_background_checks();
         self.process_steam_scan_window_actions();
+        self.draw_status_bar(ctx);
         self.draw_game_list(ctx);
         self.draw_main_panel(ctx);
-        self.draw_status_bar(ctx);
         self.draw_game_dialog(ctx);
         self.draw_steam_scan_dialog(ctx);
         self.draw_confirmation_dialog(ctx);
         self.draw_close_behavior_dialog(ctx);
+        self.draw_shortcut_settings_dialog(ctx);
         self.draw_help_window(ctx);
         self.process_steam_scan_window_actions();
     }
@@ -993,5 +1510,122 @@ pub(crate) fn status_color(kind: StatusKind, visuals: &egui::Visuals) -> egui::C
         StatusKind::Success => egui::Color32::from_rgb(36, 128, 72),
         StatusKind::Warning => egui::Color32::from_rgb(166, 116, 20),
         StatusKind::Error => egui::Color32::from_rgb(180, 48, 48),
+    }
+}
+
+fn offset_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as isize;
+    (current as isize + delta).rem_euclid(len) as usize
+}
+
+fn steam_link_from_candidate(candidate: &SteamGameCandidate) -> SteamLink {
+    SteamLink {
+        app_id: candidate.app_id.clone(),
+        cloud_paths: candidate
+            .save_paths
+            .iter()
+            .filter(|path| path.exists && path.is_steam_cloud_cache())
+            .map(|path| path.path.clone())
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn background_checks_create_due_auto_backup_through_real_backup_path() {
+        let root = tempdir().unwrap();
+        let save = root.path().join("save");
+        fs::create_dir_all(&save).unwrap();
+        fs::write(save.join("slot.sav"), "one").unwrap();
+
+        let mut game = GameConfig {
+            id: "game".to_owned(),
+            name: "Game".to_owned(),
+            save_path: save,
+            max_backups: None,
+            auto_cleanup_enabled: true,
+            backup_storage_mode: BackupStorageMode::Incremental,
+            steam_link: None,
+            auto_backup: AutoBackupConfig {
+                enabled: true,
+                interval_hours: 1,
+                interval_minutes: Some(1),
+                interval_unit: AutoBackupIntervalUnit::Minutes,
+                change_reminder_enabled: false,
+                last_auto_backup_at: None,
+                last_reminded_snapshot_hash: None,
+                next_auto_backup_at: Some(
+                    (Local::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                ),
+            },
+        };
+        game.auto_backup.next_auto_backup_at = scheduler::next_auto_backup_time_string(
+            &game,
+            Local::now() - chrono::Duration::minutes(2),
+        );
+
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game],
+            settings: Default::default(),
+        };
+        let mut app = test_app(config);
+        app.schedule_background_check_now();
+
+        app.run_background_checks();
+
+        assert_eq!(app.backups.len(), 1);
+        assert_eq!(app.backups[0].label.as_deref(), Some("Automatic backup"));
+        assert_eq!(app.status.kind, StatusKind::Success);
+        let saved_game = app
+            .config
+            .games
+            .iter()
+            .find(|game| game.id == "game")
+            .unwrap();
+        assert!(saved_game.auto_backup.last_auto_backup_at.is_some());
+        assert!(saved_game.auto_backup.next_auto_backup_at.is_some());
+    }
+
+    fn test_app(config: AppConfig) -> GameSaveApp {
+        GameSaveApp {
+            config,
+            selected_game_id: Some("game".to_owned()),
+            backups: Vec::new(),
+            selected_backup_path: None,
+            selected_backup_paths: BTreeSet::new(),
+            backup_delete_selection_mode: false,
+            active_list: ActiveList::Games,
+            backup_label: String::new(),
+            status: StatusMessage::info("test"),
+            presets: Vec::new(),
+            show_game_dialog: false,
+            show_steam_scan_dialog: false,
+            editing_game_id: None,
+            game_form: GameForm::default(),
+            confirm_action: None,
+            delete_backups_with_game: false,
+            steam_candidates: Vec::new(),
+            selected_steam_app_id: None,
+            selected_steam_save_path: None,
+            steam_scan_state: None,
+            app_icon: None,
+            main_hwnd: None,
+            show_close_behavior_dialog: false,
+            show_shortcut_settings_dialog: false,
+            help_window_state: None,
+            force_exit_requested: false,
+            last_window_settings_save: Instant::now(),
+            last_background_check: Instant::now(),
+        }
     }
 }

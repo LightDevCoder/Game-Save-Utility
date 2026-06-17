@@ -79,8 +79,9 @@ pub fn load_or_create_config() -> AppResult<AppConfig> {
     let raw =
         fs::read_to_string(&path).map_err(|err| AppError::io("配置文件读取失败", &path, err))?;
     let mut config: AppConfig = serde_json::from_str(&raw)?;
-    if config.backup_root.as_os_str().is_empty() {
+    if config.backup_root.as_os_str().is_empty() || is_stale_temp_backup_root(&config.backup_root) {
         config.backup_root = default_backup_root()?;
+        save_config(&config)?;
     }
     Ok(config)
 }
@@ -176,6 +177,12 @@ fn migrate_app_data_dir_inner(
     }
 
     let old_backup_root = expand_path(&config.backup_root);
+    let backup_root_was_inside_old_data_dir =
+        same_path_key(&old_backup_root, &old_dir.join("backups"))
+            || old_backup_root
+                .strip_prefix(old_dir)
+                .map(|relative| !relative.as_os_str().is_empty())
+                .unwrap_or(false);
     rewrite_backup_root_for_migration(config, old_dir, new_dir);
 
     if old_dir.exists() {
@@ -205,7 +212,10 @@ fn migrate_app_data_dir_inner(
     save_config_at(&new_dir.join("config.json"), config)?;
     cleanup_old_data_dir(old_dir)?;
 
-    if old_backup_root.exists() && !old_backup_root.starts_with(new_dir) {
+    if backup_root_was_inside_old_data_dir
+        && old_backup_root.exists()
+        && !old_backup_root.starts_with(new_dir)
+    {
         let _ = remove_dir_all_if_exists(&old_backup_root, "旧备份目录删除失败");
     }
 
@@ -269,6 +279,20 @@ fn path_key(path: &Path) -> String {
         .to_lowercase()
 }
 
+fn is_stale_temp_backup_root(path: &Path) -> bool {
+    let backup_root = expand_path(path);
+    let temp_dir = std::env::temp_dir();
+    let temp_key = path_key(&temp_dir);
+    let backup_key = path_key(&backup_root);
+    let is_in_temp_dir = backup_key.starts_with(&(temp_key + "\\"))
+        || backup_key.contains("\\appdata\\local\\temp\\");
+    if !is_in_temp_dir {
+        return false;
+    }
+
+    backup_key.split('\\').any(|part| part.starts_with(".tmp"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +340,38 @@ mod tests {
         assert!(default_dir.parent().unwrap().join(LOCATION_FILE).exists());
         assert!(!default_dir.exists());
         assert_eq!(config.backup_root, new_dir.join("backups"));
+    }
+
+    #[test]
+    fn stale_temp_backup_root_is_detected() {
+        let stale_root = std::env::temp_dir().join(".tmpFGD30x").join("backups");
+        assert!(is_stale_temp_backup_root(&stale_root));
+
+        let stable_root = PathBuf::from(r"D:\Temp\GSU-Test\Backups");
+        assert!(!is_stale_temp_backup_root(&stable_root));
+    }
+
+    #[test]
+    fn migrate_app_data_dir_preserves_custom_backup_root_outside_data_dir() {
+        let temp = tempdir().unwrap();
+        let old_dir = temp.path().join("old").join(APP_NAME);
+        let default_dir = old_dir.clone();
+        let new_dir = temp.path().join("new_parent").join(APP_NAME);
+        let custom_backup_root = temp.path().join("custom_backups");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&custom_backup_root).unwrap();
+        fs::write(custom_backup_root.join("keep.sav"), "save").unwrap();
+        fs::write(old_dir.join("config.json"), "{}").unwrap();
+
+        let mut config = AppConfig {
+            backup_root: custom_backup_root.clone(),
+            games: Vec::new(),
+            settings: AppSettings::default(),
+        };
+
+        migrate_app_data_dir_inner(&old_dir, &new_dir, &default_dir, &mut config).unwrap();
+
+        assert_eq!(config.backup_root, custom_backup_root);
+        assert!(config.backup_root.join("keep.sav").exists());
     }
 }

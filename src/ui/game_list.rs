@@ -1,4 +1,4 @@
-use crate::app::{status_color, ConfirmAction, GameSaveApp};
+use crate::app::{ActiveList, ConfirmAction, GameSaveApp};
 use crate::i18n::Text as T;
 use eframe::egui;
 
@@ -16,7 +16,7 @@ impl GameSaveApp {
                 ui.separator();
 
                 let available = ui.available_rect_before_wrap();
-                let footer_height = 196.0;
+                let footer_height = 132.0;
                 let footer_top = (available.max.y - footer_height)
                     .max(available.min.y + 80.0)
                     .min(available.max.y);
@@ -30,11 +30,12 @@ impl GameSaveApp {
                 );
 
                 ui.allocate_ui_at_rect(list_rect, |ui| {
+                    let active = self.active_list == ActiveList::Games;
                     egui::ScrollArea::vertical()
                         .id_source("game_list_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.add_space(8.0);
+                            ui.add_space(4.0);
                             if self.config.games.is_empty() {
                                 ui.label(self.text(T::NoGames));
                             } else {
@@ -44,7 +45,10 @@ impl GameSaveApp {
                                         .selected_game_id
                                         .as_ref()
                                         .is_some_and(|id| id == &game.id);
-                                    if ui.selectable_label(selected, &game.name).clicked() {
+                                    let response =
+                                        ui.selectable_label(selected && active, &game.name);
+                                    if response.clicked() {
+                                        self.active_list = ActiveList::Games;
                                         self.select_game(game.id);
                                     }
                                 }
@@ -54,15 +58,6 @@ impl GameSaveApp {
 
                 ui.allocate_ui_at_rect(footer_rect, |ui| {
                     ui.separator();
-                    let color = status_color(self.status.kind, ui.visuals());
-                    egui::ScrollArea::vertical()
-                        .id_source("game_list_status")
-                        .max_height(60.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.colored_label(color, &self.status.text);
-                        });
-                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let enabled = self.selected_game_id.is_some();
                         if ui

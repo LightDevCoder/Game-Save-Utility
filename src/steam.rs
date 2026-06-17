@@ -5,11 +5,19 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const STEAM_CLOUD_LOCAL_CACHE_SOURCE: &str = "Steam Cloud 本地缓存";
+
 #[derive(Clone, Debug)]
 pub struct SteamSavePathCandidate {
     pub path: PathBuf,
     pub source: String,
     pub exists: bool,
+}
+
+impl SteamSavePathCandidate {
+    pub fn is_steam_cloud_cache(&self) -> bool {
+        self.source == STEAM_CLOUD_LOCAL_CACHE_SOURCE
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +192,7 @@ fn save_path_candidates(
                     &mut candidates,
                     &mut seen,
                     remote,
-                    "Steam Cloud 本地缓存".to_owned(),
+                    STEAM_CLOUD_LOCAL_CACHE_SOURCE.to_owned(),
                 );
             }
         }
@@ -398,10 +406,9 @@ mod tests {
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].app_id, "1091500");
         assert_eq!(games[0].name, "Cyberpunk 2077");
-        assert!(games[0]
-            .save_paths
-            .iter()
-            .any(|candidate| candidate.source == "Steam Cloud 本地缓存" && candidate.exists));
+        assert!(games[0].save_paths.iter().any(|candidate| candidate.source
+            == STEAM_CLOUD_LOCAL_CACHE_SOURCE
+            && candidate.exists));
     }
 
     fn escape_vdf_path(path: &Path) -> String {

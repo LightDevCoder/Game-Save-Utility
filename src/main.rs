@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod archive;
 mod backup;
+mod cloud;
 mod config;
 mod fs_utils;
 mod help;
@@ -9,6 +11,8 @@ mod i18n;
 mod logger;
 mod models;
 mod presets;
+mod scheduler;
+mod snapshot;
 mod steam;
 mod tray;
 mod ui;

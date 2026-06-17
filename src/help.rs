@@ -89,7 +89,7 @@ const QUICK_START_LINES: &[HelpLine] = &[
     ),
     b!("点击左下角“添加游戏”，填写游戏名称并选择存档目录。", "Click Add Game, enter the game name, and choose the save folder."),
     b!("填写可选备份标签，然后点击“立即备份”。", "Enter an optional label, then click Backup Now."),
-    b!("在备份历史中选择节点，可以恢复或删除。", "Select a backup in the history table to restore or delete it."),
+    b!("在备份历史中勾选节点，可以恢复单个备份或删除多个备份。", "Tick backups in the history table to restore one backup or delete multiple backups."),
 ];
 
 const STEAM_LINES: &[HelpLine] = &[
@@ -107,8 +107,8 @@ const STEAM_LINES: &[HelpLine] = &[
 const BACKUP_LINES: &[HelpLine] = &[
     h!("备份与恢复", "Backup and Restore"),
     p!(
-        "备份会递归复制存档目录，并为每个备份节点写入 metadata.json。",
-        "Backup recursively copies the save folder and writes metadata.json for each backup node."
+        "每个备份节点都会写入 metadata.json，并记录可恢复当前存档快照所需的信息。",
+        "Each backup node writes metadata.json and records the information needed to restore that save snapshot."
     ),
     b!(
         "备份失败时会清理未完成的临时目录。",
@@ -119,8 +119,64 @@ const BACKUP_LINES: &[HelpLine] = &[
         "Restore always creates a pre-restore safety backup first."
     ),
     b!(
-        "删除单个备份不会影响当前存档目录。",
-        "Deleting one backup does not touch the current save folder."
+        "“全选备份”只用于删除选择，不会触发备份，也不会执行批量恢复。",
+        "Select All only affects delete selection. It does not start a backup or batch restore."
+    ),
+    b!(
+        "删除一个或多个备份不会影响当前存档目录。",
+        "Deleting one or more backups does not touch the current save folder."
+    ),
+];
+
+const STORAGE_LINES: &[HelpLine] = &[
+    h!("备份格式", "Backup Formats"),
+    p!(
+        "每个游戏可以在“添加/编辑游戏”窗口中选择备份格式。新游戏默认使用增量备份。",
+        "Each game can choose its backup format in the Add/Edit Game window. New games use incremental backups by default."
+    ),
+    b!(
+        "增量备份：每个备份节点包含 metadata.json 和 manifest.json，实际文件内容保存在游戏备份目录下的 .objects 共享对象库中。",
+        "Incremental backups: each backup node contains metadata.json and manifest.json; actual file contents live in the game's .objects shared object store."
+    ),
+    b!(
+        "首次增量备份会把当前所有文件内容写入对象库，历史列表显示为“全量”；后续备份只新增变化内容，显示为“增量”。每个 manifest 仍然代表一个完整快照。",
+        "The first incremental backup stores all current file contents and is shown as Full; later backups only add changed content and are shown as Incremental. Every manifest still represents a complete snapshot."
+    ),
+    b!(
+        "更换备份根目录不会自动创建备份；在新的空备份目录里，下一次手动备份会成为该目录下的首次完整快照。",
+        "Changing the backup root does not create a backup. In a fresh empty root, the next manual backup becomes that root's first full snapshot."
+    ),
+    b!(
+        "ZIP 压缩备份：每个备份节点包含 metadata.json 和 save_files.zip，属于压缩后的完整快照。",
+        "ZIP backups: each backup node contains metadata.json and save_files.zip, which is a compressed full snapshot."
+    ),
+    b!(
+        "v0.1.0 的 save_files/ 完整复制备份仍可扫描、恢复和删除。",
+        "v0.1.0 save_files/ full-copy backups can still be scanned, restored, and deleted."
+    ),
+];
+
+const SCHEDULE_LINES: &[HelpLine] = &[
+    h!("定时自动备份", "Scheduled Auto Backup"),
+    p!(
+        "定时自动备份在应用运行或最小化到系统托盘时生效，不会创建 Windows 服务或开机启动项。",
+        "Scheduled auto backup works while the app is running or minimized to tray. It does not create a Windows service or startup item."
+    ),
+    b!(
+        "在“添加/编辑游戏”窗口中启用定时自动备份，并设置间隔数值和单位。",
+        "Enable scheduled auto backup in the Add/Edit Game window and set the interval value plus unit."
+    ),
+    b!(
+        "间隔只接受整数；可以选择“分钟”或“小时”。例如半小时可设置为 30 分钟。",
+        "Intervals accept integers only; choose Minutes or Hours. For example, use 30 Minutes for half an hour."
+    ),
+    b!(
+        "只有到达间隔且当前存档相对最近备份发生变化时，才会自动创建备份。",
+        "An automatic backup is created only when the interval is due and current saves differ from the latest backup."
+    ),
+    b!(
+        "存档变更提醒只提示存在未备份变更，不会强制创建备份。",
+        "Save-change reminders only warn about unbacked changes; they do not force a backup."
     ),
 ];
 
@@ -138,6 +194,39 @@ const CLEANUP_LINES: &[HelpLine] = &[
         "普通备份和恢复前自动备份都会参与清理。",
         "Normal backups and pre-restore backups are both included in cleanup."
     ),
+];
+
+const CLOUD_LINES: &[HelpLine] = &[
+    h!("Steam Cloud 提示", "Steam Cloud Warnings"),
+    p!(
+        "通过 Steam 扫描加入游戏时，工具会保存 Steam AppID 和可用的 Steam Cloud 本地缓存候选路径。",
+        "When a game is added through Steam scan, the app stores the Steam AppID and available Steam Cloud local cache candidate paths."
+    ),
+    b!(
+        "工具只比较本地存档目录和 Steam Cloud 本地缓存目录的最新修改时间。",
+        "The app only compares latest modified times between the local save folder and Steam Cloud local cache folder."
+    ),
+    b!(
+        "检测到时间差异时只显示风险提示，不会阻止备份或恢复。",
+        "When a time difference is detected, the app only shows a risk warning; it does not block backup or restore."
+    ),
+    b!(
+        "工具不会访问 Steam 网络 API，也不会读取账号、密码、Cookie、验证码或登录状态。",
+        "The app does not call Steam network APIs and does not read account credentials, cookies, verification codes, or login state."
+    ),
+];
+
+const SHORTCUT_LINES: &[HelpLine] = &[
+    h!("快捷键", "Keyboard Shortcuts"),
+    p!(
+        "顶部工具栏的“快捷键”按钮可以打开快捷键设置，并可启用或关闭快捷键。",
+        "The Shortcuts button in the toolbar opens shortcut settings and lets you enable or disable shortcuts."
+    ),
+    b!("Ctrl+S：为当前选中游戏快速备份。", "Ctrl+S: back up the selected game."),
+    b!("Ctrl+R：仅在恰好选中一个备份时打开恢复确认。", "Ctrl+R: open restore confirmation only when exactly one backup is selected."),
+    b!("↑ / ↓：在当前活跃列表中移动选择。", "Up / Down: move selection in the active list."),
+    b!("← / →：在游戏列表和备份历史之间切换活跃区域。", "Left / Right: switch the active area between games and backup history."),
+    b!("光标在文本输入框内时，快捷键不会触发备份或恢复。", "Shortcuts are ignored while a text field is active."),
 ];
 
 const DATA_LINES: &[HelpLine] = &[
@@ -198,10 +287,34 @@ static HELP_TOPICS: &[HelpTopic] = &[
         lines: BACKUP_LINES,
     },
     HelpTopic {
+        id: "storage",
+        zh_title: "备份格式",
+        en_title: "Backup Formats",
+        lines: STORAGE_LINES,
+    },
+    HelpTopic {
+        id: "schedule",
+        zh_title: "定时自动备份",
+        en_title: "Scheduled Auto Backup",
+        lines: SCHEDULE_LINES,
+    },
+    HelpTopic {
         id: "cleanup",
         zh_title: "自动清理",
         en_title: "Auto Cleanup",
         lines: CLEANUP_LINES,
+    },
+    HelpTopic {
+        id: "cloud",
+        zh_title: "Steam Cloud 提示",
+        en_title: "Steam Cloud Warnings",
+        lines: CLOUD_LINES,
+    },
+    HelpTopic {
+        id: "shortcuts",
+        zh_title: "快捷键",
+        en_title: "Keyboard Shortcuts",
+        lines: SHORTCUT_LINES,
     },
     HelpTopic {
         id: "data",
@@ -263,5 +376,10 @@ mod tests {
         let topic = topic_by_id("steam");
         assert!(topic.contains(Language::ZhCn, "候选"));
         assert!(topic.contains(Language::EnUs, "candidate"));
+
+        assert!(topic_by_id("storage").contains(Language::ZhCn, "增量"));
+        assert!(topic_by_id("storage").contains(Language::EnUs, "ZIP"));
+        assert!(topic_by_id("schedule").contains(Language::ZhCn, "定时"));
+        assert!(topic_by_id("shortcuts").contains(Language::EnUs, "Ctrl+S"));
     }
 }
