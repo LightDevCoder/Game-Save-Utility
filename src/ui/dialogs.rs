@@ -4,7 +4,7 @@ use crate::app::{
 };
 use crate::help::{self, HelpLineKind};
 use crate::i18n::{t, Text as T};
-use crate::models::{CloseBehavior, Language};
+use crate::models::{AutoBackupIntervalUnit, BackupStorageMode, CloseBehavior, Language};
 use crate::presets;
 use eframe::egui;
 
@@ -120,6 +120,92 @@ impl GameSaveApp {
                                 .hint_text(unlimited_hint),
                         );
                     });
+
+                    ui.horizontal(|ui| {
+                        let storage_mode_text = self.text(T::BackupStorageMode);
+                        let incremental_text = self.text(T::IncrementalStorage);
+                        let zip_text = self.text(T::ZipStorage);
+                        ui.label(storage_mode_text);
+                        egui::ComboBox::from_id_source("backup_storage_mode")
+                            .selected_text(match self.game_form.backup_storage_mode {
+                                BackupStorageMode::Incremental => incremental_text,
+                                BackupStorageMode::Zip => zip_text,
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.game_form.backup_storage_mode,
+                                    BackupStorageMode::Incremental,
+                                    incremental_text,
+                                );
+                                ui.selectable_value(
+                                    &mut self.game_form.backup_storage_mode,
+                                    BackupStorageMode::Zip,
+                                    zip_text,
+                                );
+                            });
+                    });
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let auto_backup_text = self.text(T::AutoBackup);
+                            ui.add_sized(
+                                [118.0, 28.0],
+                                egui::Checkbox::new(
+                                    &mut self.game_form.auto_backup_enabled,
+                                    auto_backup_text,
+                                ),
+                            );
+                            ui.add_sized(
+                                [44.0, 28.0],
+                                egui::Label::new(self.text(T::AutoBackupIntervalHours)),
+                            );
+                            ui.add_sized(
+                                [72.0, 24.0],
+                                egui::TextEdit::singleline(
+                                    &mut self.game_form.auto_backup_interval_value,
+                                ),
+                            );
+                            let minutes_text = self.text(T::Minutes);
+                            let hours_text = self.text(T::Hours);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(96.0, 28.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    egui::ComboBox::from_id_source("auto_backup_interval_unit")
+                                        .width(86.0)
+                                        .selected_text(
+                                            match self.game_form.auto_backup_interval_unit {
+                                                AutoBackupIntervalUnit::Minutes => minutes_text,
+                                                AutoBackupIntervalUnit::Hours => hours_text,
+                                            },
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.game_form.auto_backup_interval_unit,
+                                                AutoBackupIntervalUnit::Minutes,
+                                                minutes_text,
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.game_form.auto_backup_interval_unit,
+                                                AutoBackupIntervalUnit::Hours,
+                                                hours_text,
+                                            );
+                                        });
+                                },
+                            );
+                            let reminder_text = self.text(T::ChangeReminder);
+                            ui.add_sized(
+                                [136.0, 28.0],
+                                egui::Checkbox::new(
+                                    &mut self.game_form.change_reminder_enabled,
+                                    reminder_text,
+                                ),
+                            );
+                        },
+                    );
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -408,7 +494,7 @@ impl GameSaveApp {
         source: &'a str,
     ) -> std::borrow::Cow<'a, str> {
         match source {
-            "Steam Cloud 本地缓存" => {
+            crate::steam::STEAM_CLOUD_LOCAL_CACHE_SOURCE => {
                 std::borrow::Cow::Borrowed(t(language, T::SteamCloudLocalCache))
             }
             "内置常见路径" => std::borrow::Cow::Borrowed(t(language, T::BuiltInCommonPaths)),
@@ -424,7 +510,7 @@ impl GameSaveApp {
         let title = match action {
             ConfirmAction::BackupEmptySaveDir { .. } => self.text(T::ConfirmEmptyBackupTitle),
             ConfirmAction::RestoreBackup { .. } => self.text(T::ConfirmRestoreTitle),
-            ConfirmAction::DeleteBackup { .. } => self.text(T::ConfirmDeleteBackupTitle),
+            ConfirmAction::DeleteBackups { .. } => self.text(T::ConfirmDeleteBackupsTitle),
             ConfirmAction::DeleteGame { .. } => self.text(T::ConfirmDeleteGameTitle),
         };
 
@@ -440,10 +526,41 @@ impl GameSaveApp {
                     ConfirmAction::RestoreBackup { backup_path } => {
                         ui.label(self.text(T::ConfirmRestoreBody));
                         ui.monospace(backup_path.display().to_string());
+                        if let Some(game) = self.selected_game().cloned() {
+                            if let Some(warning) = self.cloud_conflict_warning(&game) {
+                                ui.colored_label(egui::Color32::from_rgb(166, 116, 20), warning);
+                            }
+                        }
                     }
-                    ConfirmAction::DeleteBackup { backup_path } => {
-                        ui.label(self.text(T::ConfirmDeleteBackupBody));
-                        ui.monospace(backup_path.display().to_string());
+                    ConfirmAction::DeleteBackups { backup_paths } => {
+                        ui.label(match self.language() {
+                            Language::ZhCn => format!(
+                                "将删除选中的 {} 个备份节点，不会影响当前存档目录。",
+                                backup_paths.len()
+                            ),
+                            Language::EnUs => format!(
+                                "This will delete {} selected backup nodes. Current saves are untouched.",
+                                backup_paths.len()
+                            ),
+                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for path in backup_paths.iter().take(8) {
+                                    ui.monospace(path.display().to_string());
+                                }
+                                if backup_paths.len() > 8 {
+                                    ui.label(match self.language() {
+                                        Language::ZhCn => {
+                                            format!("还有 {} 个备份未显示", backup_paths.len() - 8)
+                                        }
+                                        Language::EnUs => {
+                                            format!("{} more backups not shown", backup_paths.len() - 8)
+                                        }
+                                    });
+                                }
+                            });
                     }
                     ConfirmAction::DeleteGame { .. } => {
                         ui.label(self.text(T::ConfirmDeleteGameBody));
@@ -491,6 +608,48 @@ impl GameSaveApp {
                     }
                 });
             });
+    }
+
+    pub(crate) fn draw_shortcut_settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcut_settings_dialog {
+            return;
+        }
+
+        let mut open = self.show_shortcut_settings_dialog;
+        egui::Window::new(self.text(T::ShortcutSettingsTitle))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                let enabled_text = self.text(T::KeyboardShortcutsEnabled);
+                if ui
+                    .checkbox(
+                        &mut self.config.settings.keyboard_shortcuts_enabled,
+                        enabled_text,
+                    )
+                    .changed()
+                {
+                    self.save_config();
+                }
+
+                ui.separator();
+                let shortcuts = shortcut_rows(self.language());
+                egui::Grid::new("shortcut_settings_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 8.0])
+                    .show(ui, |ui| {
+                        for (keys, action) in shortcuts {
+                            ui.monospace(*keys);
+                            ui.label(*action);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.label(shortcut_note(self.language()));
+            });
+
+        self.show_shortcut_settings_dialog = open && self.show_shortcut_settings_dialog;
     }
 
     pub(crate) fn draw_help_window(&mut self, ctx: &egui::Context) {
@@ -686,12 +845,42 @@ impl GameSaveApp {
             ConfirmAction::RestoreBackup { backup_path } => {
                 self.restore_selected_backup(&backup_path);
             }
-            ConfirmAction::DeleteBackup { backup_path } => {
-                self.delete_selected_backup(&backup_path);
+            ConfirmAction::DeleteBackups { backup_paths } => {
+                self.delete_selected_backups(&backup_paths);
             }
             ConfirmAction::DeleteGame { game_id } => {
                 self.delete_game(&game_id);
             }
         }
+    }
+}
+
+fn shortcut_rows(language: Language) -> &'static [(&'static str, &'static str)] {
+    match language {
+        Language::ZhCn => &[
+            ("Ctrl+S", "为当前选中游戏快速备份"),
+            ("Ctrl+R", "对当前选中备份打开恢复确认"),
+            ("↑ / ↓", "在当前活跃列表中移动选择"),
+            ("← / →", "在游戏列表和备份历史之间切换活跃区域"),
+        ],
+        Language::EnUs => &[
+            ("Ctrl+S", "Back up the selected game"),
+            (
+                "Ctrl+R",
+                "Open restore confirmation for the selected backup",
+            ),
+            ("↑ / ↓", "Move selection in the active list"),
+            (
+                "← / →",
+                "Switch the active area between games and backup history",
+            ),
+        ],
+    }
+}
+
+fn shortcut_note(language: Language) -> &'static str {
+    match language {
+        Language::ZhCn => "光标在文本输入框内时，快捷键不会触发备份或恢复。",
+        Language::EnUs => "Shortcuts are ignored while a text field is active.",
     }
 }
