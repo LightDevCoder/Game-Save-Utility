@@ -27,7 +27,7 @@
 
 ### 界面截图
 
-![中文界面](./中文界面.png)
+![中文界面](./中文界面-0.1.1.png)
 
 ### 主要功能
 
@@ -272,7 +272,7 @@ The app is built with Rust + eframe/egui and is designed to ship as a mostly sel
 
 ### Screenshot
 
-![English interface](./英文界面.png)
+![English interface](./英文界面-0.1.1.png)
 
 ### Features
 
