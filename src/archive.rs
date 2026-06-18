@@ -170,6 +170,8 @@ mod tests {
         writer.finish().unwrap();
 
         let err = extract_zip_backup(&archive_path, &root.path().join("out")).unwrap_err();
-        assert!(err.user_message().contains("ZIP"));
+        assert!(err
+            .user_message_for_language(crate::models::Language::EnUs)
+            .contains("ZIP"));
     }
 }

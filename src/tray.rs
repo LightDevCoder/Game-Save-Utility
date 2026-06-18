@@ -34,6 +34,8 @@ mod platform {
         icon_added: bool,
     }
 
+    // SAFETY: TrayState only stores opaque Win32 handles and an integer window-procedure pointer.
+    // Access is serialized by TRAY_STATE, and Win32 operations are dispatched to the UI thread.
     unsafe impl Send for TrayState {}
 
     static TRAY_STATE: Mutex<Option<TrayState>> = Mutex::new(None);
@@ -62,14 +64,18 @@ mod platform {
             if existing.hwnd == hwnd {
                 return;
             }
+            // SAFETY: existing.hwnd is the window handle previously registered in TRAY_STATE.
             unsafe {
                 delete_icon(existing.hwnd);
             }
         }
 
+        // SAFETY: hwnd comes from eframe's live Win32 window handle. The replacement procedure
+        // uses the Win32 WNDPROC ABI and the returned procedure is retained for forwarding.
         let old_wnd_proc = unsafe {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, tray_window_proc as *const () as isize)
         };
+        // SAFETY: hwnd is valid and add_or_modify_icon fully initializes NOTIFYICONDATAW.
         let icon_added = unsafe { add_or_modify_icon(hwnd, NIM_ADD) };
         *state = Some(TrayState {
             hwnd,
@@ -82,6 +88,7 @@ mod platform {
         TRAY_LANGUAGE_IS_ENGLISH.store(matches!(language, Language::EnUs), Ordering::SeqCst);
         if let Some(existing) = TRAY_STATE.lock().ok().and_then(|state| *state) {
             if existing.icon_added {
+                // SAFETY: the icon was previously added for this valid stored window handle.
                 unsafe {
                     add_or_modify_icon(existing.hwnd, NIM_MODIFY);
                 }
@@ -91,6 +98,7 @@ mod platform {
 
     pub fn hide_window(hwnd: WindowHandle) {
         if !hwnd.is_null() {
+            // SAFETY: callers pass the live eframe Win32 window handle and only visibility changes.
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
             }
@@ -99,6 +107,7 @@ mod platform {
 
     pub fn show_window(hwnd: WindowHandle) {
         if !hwnd.is_null() {
+            // SAFETY: callers pass the live eframe Win32 window handle.
             unsafe {
                 ShowWindow(hwnd, SW_SHOW);
                 ShowWindow(hwnd, SW_RESTORE);
@@ -120,6 +129,7 @@ mod platform {
             return;
         };
 
+        // SAFETY: the stored handle and old procedure were produced during init for this window.
         unsafe {
             if existing.icon_added {
                 delete_icon(existing.hwnd);
@@ -175,12 +185,15 @@ mod platform {
             return 0;
         }
 
-        let old_proc = mem::transmute(old_wnd_proc);
+        // SAFETY: SetWindowLongPtrW returned the previous WNDPROC encoded as an isize.
+        let old_proc = mem::transmute::<isize, winapi::um::winuser::WNDPROC>(old_wnd_proc);
+        // SAFETY: old_proc is the previous procedure for hwnd and receives the original message.
         CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
     }
 
     unsafe fn request_exit(hwnd: HWND) {
         EXIT_REQUESTED.store(true, Ordering::SeqCst);
+        // SAFETY: hwnd is supplied by the active tray callback.
         ShowWindow(hwnd, SW_SHOW);
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
@@ -188,6 +201,7 @@ mod platform {
     }
 
     unsafe fn show_menu(hwnd: HWND) {
+        // SAFETY: CreatePopupMenu returns an owned HMENU that is destroyed before returning.
         let menu = CreatePopupMenu();
         if menu.is_null() {
             return;
@@ -199,10 +213,12 @@ mod platform {
             "显示窗口"
         });
         let exit_text = wide(if is_english() { "Exit" } else { "退出" });
+        // SAFETY: menu is valid and the UTF-16 buffers remain alive through these calls.
         AppendMenuW(menu, MF_STRING, MENU_SHOW, show_text.as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_EXIT, exit_text.as_ptr());
 
         let mut point = POINT { x: 0, y: 0 };
+        // SAFETY: point is writable and hwnd/menu remain valid for the popup-menu interaction.
         if GetCursorPos(&mut point) != 0 {
             SetForegroundWindow(hwnd);
             TrackPopupMenu(
@@ -215,10 +231,12 @@ mod platform {
                 ptr::null(),
             );
         }
+        // SAFETY: menu was created successfully above and is no longer in use.
         DestroyMenu(menu);
     }
 
     unsafe fn add_or_modify_icon(hwnd: HWND, message: u32) -> bool {
+        // SAFETY: zero is a valid initial state for NOTIFYICONDATAW before required fields are set.
         let mut data: NOTIFYICONDATAW = mem::zeroed();
         data.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
@@ -232,26 +250,32 @@ mod platform {
         } else {
             "单机游戏存档备份与恢复工具"
         });
-        for (target, ch) in data.szTip.iter_mut().zip(tip.into_iter()) {
+        for (target, ch) in data.szTip.iter_mut().zip(tip) {
             *target = ch;
         }
 
+        // SAFETY: data is fully initialized for NIM_ADD/NIM_MODIFY and hwnd is live.
         Shell_NotifyIconW(message, &mut data) != 0
     }
 
     unsafe fn delete_icon(hwnd: HWND) {
+        // SAFETY: zero is a valid initial state and the identifying fields are set below.
         let mut data: NOTIFYICONDATAW = mem::zeroed();
         data.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
         data.uID = TRAY_UID;
+        // SAFETY: data identifies the tray icon previously associated with hwnd.
         Shell_NotifyIconW(NIM_DELETE, &mut data);
     }
 
     unsafe fn load_icon() -> HICON {
+        // SAFETY: a null module name requests the current process module.
         let module = GetModuleHandleW(ptr::null());
-        let resource_id = 1usize as *const u16;
+        let resource_id = ptr::with_exposed_provenance::<u16>(1);
+        // SAFETY: resource_id uses Win32 MAKEINTRESOURCE semantics for icon resource 1.
         let icon = LoadIconW(module, resource_id);
         if icon.is_null() {
+            // SAFETY: a null module with IDI_APPLICATION requests the shared system icon.
             LoadIconW(ptr::null_mut(), IDI_APPLICATION)
         } else {
             icon

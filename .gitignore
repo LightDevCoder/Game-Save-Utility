@@ -3,3 +3,7 @@
 *.tmp
 *.bak
 checkbox.md
+review_bundle/
+optimized_review_bundle/
+*.zip
+/dist/

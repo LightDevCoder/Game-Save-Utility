@@ -25,9 +25,17 @@
 
 项目使用 Rust + eframe/egui 开发，目标是生成尽量独立的单个 exe 文件。运行应用不需要安装 Node、Python、Java、Electron 或 .NET Runtime。
 
+### 版本 0.1.2
+
+0.1.2 是一个维护与稳定性增强版本，重点改进备份安全、配置恢复、错误提示本地化和 Windows 发布验证。
+
+本版本不包含重大新功能，主要修复和优化自动备份清理、增量备份恢复校验、配置备份恢复、应用数据标识迁移、中英文错误提示一致性等问题。
+
+本项目定位为 Windows 单平台工具。新应用数据目录为 `%LOCALAPPDATA%\GameSaveUtility`；旧 `GameSaveBackupTool` 数据目录和位置文件仍会兼容识别，并在安全条件满足时迁移。
+
 ### 界面截图
 
-![中文界面](./中文界面-0.1.1.png)
+![中文界面](./中文界面-latest.png)
 
 ### 主要功能
 
@@ -55,7 +63,7 @@
 - 首次关闭时可选择“最小化到系统托盘”或“直接退出软件”
 - 支持系统托盘图标，双击恢复窗口，右键菜单可显示窗口或正常退出
 - 自动记住主窗口大小和最大化状态
-- 支持更改 `GameSaveBackupTool` 数据目录，并迁移旧目录内容
+- 支持更改 `GameSaveUtility` 数据目录，并迁移旧目录内容
 - 支持中文 / English 双语界面，顶部按钮可切换并持久保存
 - 顶部提供“使用文档 / Docs”按钮，打开可拖出主窗口的独立帮助窗口，支持目录和搜索
 - 内置应用图标，并嵌入到 release exe
@@ -92,7 +100,7 @@
 应用会自动在当前 Windows 用户的应用数据目录下创建配置、日志和默认备份目录：
 
 ```text
-%APPDATA%/GameSaveBackupTool/
+%LOCALAPPDATA%/GameSaveUtility/
   config.json
   logs/
     app.log
@@ -102,8 +110,11 @@
 配置文件为 JSON，便于查看、迁移和排查问题。主界面顶部提供“数据目录 -> 更改并迁移”。选择新位置后，应用会迁移配置、日志和默认备份目录，并写入位置文件：
 
 ```text
-%APPDATA%/GameSaveBackupTool.location.json
+%LOCALAPPDATA%/GameSaveUtility.location.json
 ```
+
+首次运行新版时，如果新目录不存在而旧目录
+`%LOCALAPPDATA%/GameSaveBackupTool/` 存在，应用会将旧目录迁移为新目录，并保留配置与备份。
 
 ### 备份目录结构
 
@@ -192,7 +203,7 @@ cargo build --release
 生成文件示例：
 
 ```text
-target/release/Game_Save_Utility_V0.1.1.exe
+target/release/Game_Save_Utility_V0.1.2.exe
 ```
 
 脚本会按 `Cargo.toml` 中的版本号生成文件名。发布构建已启用 LTO、单代码生成单元和 strip。
@@ -200,7 +211,7 @@ target/release/Game_Save_Utility_V0.1.1.exe
 ### 重要命名约定
 
 - 项目正式名称和用户可见名称统一为 `Game Save Utility`。
-- 正式发布文件名必须带版本号，例如 `Game_Save_Utility_V0.1.1.exe`。
+- 正式发布文件名必须带版本号，例如 `Game_Save_Utility_V0.1.2.exe`。
 - Cargo 内部包名为 `game-save-utility`。
 - 不要再使用旧名称 `game-save-backup-tool` 作为项目名或发布文件名。
 
@@ -248,10 +259,12 @@ scripts/
 
 ### 后续可改进项
 
-- 复制进度条和后台任务
+- 备份和恢复后台任务
+- 大文件复制进度条
+- Steam 扫描后台化
+- 自动备份目录扫描节流，减少主线程 hash 开销
 - 导入、导出配置
 - 搜索游戏
-- 恢复前自动备份保留策略优化
 - 更完整的测试覆盖
 - 安装包
 
@@ -270,9 +283,17 @@ scripts/
 
 The app is built with Rust + eframe/egui and is designed to ship as a mostly self-contained exe. Users do not need Node, Python, Java, Electron, or the .NET Runtime to run it.
 
+### Version 0.1.2
+
+Version 0.1.2 is a maintenance and stability release focused on backup safety, configuration recovery, localization consistency, and Windows release verification.
+
+This version does not introduce major new user-facing features. It improves automatic backup cleanup, incremental backup restore validation, configuration backup recovery, app data identifier migration, and Chinese/English user-facing messages.
+
+Game Save Utility remains a Windows-only tool. The new application data directory is `%LOCALAPPDATA%\GameSaveUtility`; legacy `GameSaveBackupTool` data directories and location files remain supported and are migrated when it is safe to do so.
+
 ### Screenshot
 
-![English interface](./英文界面-0.1.1.png)
+![English interface](./英文界面-latest.png)
 
 ### Features
 
@@ -300,7 +321,7 @@ The app is built with Rust + eframe/egui and is designed to ship as a mostly sel
 - Choose whether closing the window minimizes to tray or exits the app
 - Restore the window from the system tray and exit through the tray menu
 - Remember the main window size and maximized state
-- Move the `GameSaveBackupTool` data directory and migrate existing data
+- Move the `GameSaveUtility` data directory and migrate existing data
 - Switch between Chinese and English in the app, with the choice saved to config
 - Open a detachable Help / Docs window with contents and search
 - Embed an application icon into the release exe
@@ -337,7 +358,7 @@ The English / 中文 button in the top toolbar switches the UI language. The Hel
 The app creates config, logs, and the default backup folder under the current Windows user's app data directory:
 
 ```text
-%APPDATA%/GameSaveBackupTool/
+%LOCALAPPDATA%/GameSaveUtility/
   config.json
   logs/
     app.log
@@ -347,8 +368,12 @@ The app creates config, logs, and the default backup folder under the current Wi
 The config file is JSON, so it is easy to inspect, move, and troubleshoot. The toolbar includes a Data Directory -> Change and Migrate action. After a successful migration, the app writes a location file:
 
 ```text
-%APPDATA%/GameSaveBackupTool.location.json
+%LOCALAPPDATA%/GameSaveUtility.location.json
 ```
+
+On the first run of the renamed version, if the new folder does not exist but
+`%LOCALAPPDATA%/GameSaveBackupTool/` does, the app migrates the legacy folder
+to the new location while preserving configuration and backups.
 
 ### Backup Layout
 
@@ -435,7 +460,7 @@ For user-facing release builds, use the script:
 Example output:
 
 ```text
-target/release/Game_Save_Utility_V0.1.1.exe
+target/release/Game_Save_Utility_V0.1.2.exe
 ```
 
 The script reads the version from `Cargo.toml` and creates a versioned release filename. Release builds enable LTO, a single codegen unit, and strip.
@@ -443,7 +468,7 @@ The script reads the version from `Cargo.toml` and creates a versioned release f
 ### Naming Rules
 
 - The official project and user-facing name is `Game Save Utility`.
-- Release exe filenames must include the version, for example `Game_Save_Utility_V0.1.1.exe`.
+- Release exe filenames must include the version, for example `Game_Save_Utility_V0.1.2.exe`.
 - The internal Cargo package name is `game-save-utility`.
 - Do not use the old name `game-save-backup-tool` for the project or release files.
 
@@ -491,9 +516,11 @@ scripts/
 
 ### Roadmap
 
-- Copy progress and background tasks
+- Background backup and restore tasks
+- File-copy progress reporting
+- Background Steam library scanning
+- Throttled automatic-backup directory hashing
 - Import and export config
 - Game search
-- Better retention policy for pre-restore backups
 - More complete test coverage
 - Installer package

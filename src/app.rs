@@ -15,7 +15,7 @@ use crate::{backup, cloud, scheduler};
 use chrono::Local;
 use eframe::egui;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -157,7 +157,11 @@ pub struct GameSaveApp {
 }
 
 impl GameSaveApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, app_icon: Option<Arc<egui::IconData>>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        app_icon: Option<Arc<egui::IconData>>,
+        loaded_config: Option<config::ConfigLoadResult>,
+    ) -> Self {
         configure_fonts(&cc.egui_ctx);
         let main_hwnd = tray::hwnd_from_creation_context(cc);
         if let Some(hwnd) = main_hwnd {
@@ -166,30 +170,58 @@ impl GameSaveApp {
 
         let logger_error = logger::init().err();
 
-        let config = match config::load_or_create_config() {
-            Ok(config) => config,
-            Err(err) => {
-                logger::error(format!("配置读取失败: {}", err.user_message()));
-                let status = StatusMessage::error(format!(
-                    "配置读取失败，已使用临时默认配置: {}",
-                    err.user_message()
-                ));
-                let config = config::default_config().unwrap_or_else(|_| AppConfig {
-                    backup_root: PathBuf::from("backups"),
-                    games: Vec::new(),
-                    settings: Default::default(),
-                });
-                return Self::from_config(cc, app_icon, main_hwnd, config, status);
-            }
-        };
-        let status = if let Some(err) = logger_error {
-            match config.settings.language {
-                Language::ZhCn => {
-                    StatusMessage::warning(format!("日志初始化失败: {}", err.user_message()))
+        let loaded = match loaded_config {
+            Some(loaded) => loaded,
+            None => match config::load_or_create_config() {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    logger::error(format!("Configuration load failed: {err}"));
+                    let config = config::default_config().unwrap_or_else(|_| AppConfig {
+                        backup_root: PathBuf::from("backups"),
+                        games: Vec::new(),
+                        settings: Default::default(),
+                    });
+                    let language = config.settings.language;
+                    let status = StatusMessage::error(match language {
+                        Language::ZhCn => format!(
+                            "配置读取失败，已使用临时默认配置: {}",
+                            err.user_message_for_language(language)
+                        ),
+                        Language::EnUs => format!(
+                            "Configuration load failed; using a temporary default: {}",
+                            err.user_message_for_language(language)
+                        ),
+                    });
+                    return Self::from_config(cc, app_icon, main_hwnd, config, status);
                 }
+            },
+        };
+        let config = loaded.config;
+        let status = if let Some(recovery) = loaded.recovery {
+            logger::warn(format!("Configuration recovery used: {recovery:?}"));
+            match (config.settings.language, recovery) {
+                (Language::ZhCn, config::ConfigLoadRecovery::Backup) => {
+                    StatusMessage::warning("配置文件已从 .bak 备份恢复")
+                }
+                (Language::EnUs, config::ConfigLoadRecovery::Backup) => {
+                    StatusMessage::warning("Configuration restored from the .bak backup")
+                }
+                (Language::ZhCn, config::ConfigLoadRecovery::Default) => {
+                    StatusMessage::warning("配置文件及其备份均不可用，已创建默认配置")
+                }
+                (Language::EnUs, config::ConfigLoadRecovery::Default) => StatusMessage::warning(
+                    "The configuration and its backup were unusable; defaults were created",
+                ),
+            }
+        } else if let Some(err) = logger_error {
+            match config.settings.language {
+                Language::ZhCn => StatusMessage::warning(format!(
+                    "日志初始化失败: {}",
+                    err.user_message_for_language(Language::ZhCn)
+                )),
                 Language::EnUs => StatusMessage::warning(format!(
                     "Log initialization failed: {}",
-                    err.user_message()
+                    err.user_message_for_language(Language::EnUs)
                 )),
             }
         } else {
@@ -371,7 +403,7 @@ impl GameSaveApp {
                 logger::info("配置保存完成");
             }
             Err(err) => {
-                logger::error(format!("配置保存失败: {}", err.user_message()));
+                logger::error(format!("配置保存失败: {err}"));
                 self.set_error(err);
             }
         }
@@ -584,6 +616,7 @@ impl GameSaveApp {
     }
 
     pub(crate) fn start_backup(&mut self, allow_empty: bool) {
+        // TODO: Move backup creation to a background task and report copy progress to the UI.
         let Some(game) = self.selected_game().cloned() else {
             self.status = StatusMessage::warning(match self.language() {
                 Language::ZhCn => "请先添加或选择一个游戏",
@@ -599,7 +632,11 @@ impl GameSaveApp {
             Some(label.as_str())
         };
         let cloud_warning = self.cloud_conflict_warning(&game);
-        match backup::create_backup(&self.config, &game, label, false, allow_empty) {
+        match backup::create_backup(
+            &self.config,
+            &game,
+            backup::BackupCreateOptions::manual(label, self.language(), allow_empty),
+        ) {
             Ok(entry) => {
                 self.backup_label.clear();
                 self.selected_backup_path = Some(entry.path.clone());
@@ -622,6 +659,7 @@ impl GameSaveApp {
     }
 
     pub(crate) fn restore_selected_backup(&mut self, backup_path: &PathBuf) {
+        // TODO: Move restore materialization and directory replacement to a background task.
         let Some(game) = self.selected_game().cloned() else {
             self.status = StatusMessage::warning(match self.language() {
                 Language::ZhCn => "请先选择游戏",
@@ -760,13 +798,14 @@ impl GameSaveApp {
             }
             Err(err) => {
                 self.config.backup_root = old_backup_root;
-                logger::error(format!("备份根目录保存失败: {}", err.user_message()));
+                logger::error(format!("备份根目录保存失败: {err}"));
                 self.set_error(err);
             }
         }
     }
 
     pub(crate) fn change_app_data_dir(&mut self, selected_dir: PathBuf) {
+        // TODO: Run data-directory migration off the egui thread with progress reporting.
         match config::migrate_app_data_dir(&selected_dir, &mut self.config) {
             Ok(path) => {
                 self.refresh_backups();
@@ -786,6 +825,7 @@ impl GameSaveApp {
     }
 
     pub(crate) fn open_steam_scan_dialog(&mut self) {
+        // TODO: Run Steam library discovery in a background task.
         match steam::scan_installed_games() {
             Ok(candidates) => {
                 let state = SteamScanDialogState::from_candidates(candidates.clone());
@@ -1005,8 +1045,8 @@ impl GameSaveApp {
     }
 
     pub(crate) fn set_error(&mut self, err: AppError) {
-        let message = err.user_message();
-        logger::error(&message);
+        let message = err.user_message_for_language(self.language());
+        logger::error(err.to_string());
         self.status = StatusMessage::error(message);
     }
 
@@ -1014,15 +1054,9 @@ impl GameSaveApp {
         match opener::open(&path) {
             Ok(()) => {}
             Err(err) => {
-                self.status = match self.language() {
-                    Language::ZhCn => {
-                        StatusMessage::error(format!("打开目录失败: {} ({err})", path.display()))
-                    }
-                    Language::EnUs => StatusMessage::error(format!(
-                        "Open folder failed: {} ({err})",
-                        path.display()
-                    )),
-                };
+                logger::error(format!("Failed to open folder: {} ({err})", path.display()));
+                self.status =
+                    StatusMessage::error(open_folder_error_message(self.language(), &path, &err));
             }
         }
     }
@@ -1078,8 +1112,14 @@ impl GameSaveApp {
             }),
             Ok(None) => None,
             Err(err) => Some(match self.language() {
-                Language::ZhCn => format!("Steam Cloud 冲突检测失败: {}", err.user_message()),
-                Language::EnUs => format!("Steam Cloud conflict check failed: {}", err.user_message()),
+                Language::ZhCn => format!(
+                    "Steam Cloud 冲突检测失败: {}",
+                    err.user_message_for_language(Language::ZhCn)
+                ),
+                Language::EnUs => format!(
+                    "Steam Cloud conflict check failed: {}",
+                    err.user_message_for_language(Language::EnUs)
+                ),
             }),
         }
     }
@@ -1122,10 +1162,10 @@ impl GameSaveApp {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
             self.active_list = ActiveList::Games;
         }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
-            if !self.backups.is_empty() {
-                self.active_list = ActiveList::Backups;
-            }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight))
+            && !self.backups.is_empty()
+        {
+            self.active_list = ActiveList::Backups;
         }
     }
 
@@ -1160,6 +1200,7 @@ impl GameSaveApp {
     }
 
     pub(crate) fn run_background_checks(&mut self) {
+        // TODO: Throttle or move save-directory hashing off the egui thread.
         if self.last_background_check.elapsed() < Duration::from_secs(5) {
             return;
         }
@@ -1188,17 +1229,18 @@ impl GameSaveApp {
                 Err(err) => {
                     logger::warn(format!(
                         "Background save change check failed for {}: {}",
-                        game.name,
-                        err.user_message()
+                        game.name, err
                     ));
                     if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
                         self.status = StatusMessage::warning(match self.language() {
-                            Language::ZhCn => {
-                                format!("自动备份检查失败：{}", err.user_message())
-                            }
-                            Language::EnUs => {
-                                format!("Automatic backup check failed: {}", err.user_message())
-                            }
+                            Language::ZhCn => format!(
+                                "自动备份检查失败：{}",
+                                err.user_message_for_language(Language::ZhCn)
+                            ),
+                            Language::EnUs => format!(
+                                "Automatic backup check failed: {}",
+                                err.user_message_for_language(Language::EnUs)
+                            ),
                         });
                     }
                     continue;
@@ -1210,9 +1252,7 @@ impl GameSaveApp {
                     let backup_result = backup::create_backup(
                         &self.config,
                         &game,
-                        Some("Automatic backup"),
-                        false,
-                        false,
+                        backup::BackupCreateOptions::automatic(self.language()),
                     );
 
                     match backup_result {
@@ -1237,8 +1277,7 @@ impl GameSaveApp {
                         Err(err) => {
                             logger::warn(format!(
                                 "Automatic backup failed for {}: {}",
-                                game.name,
-                                err.user_message()
+                                game.name, err
                             ));
                             if let Some(game) =
                                 self.config.games.iter_mut().find(|game| game.id == game_id)
@@ -1248,7 +1287,8 @@ impl GameSaveApp {
                             }
                             config_changed = true;
                             if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
-                                let message = err.user_message();
+                                let language = self.language();
+                                let message = err.user_message_for_language(language);
                                 self.status = StatusMessage::warning(match self.language() {
                                     Language::ZhCn => format!("自动备份失败：{message}"),
                                     Language::EnUs => format!("Automatic backup failed: {message}"),
@@ -1280,15 +1320,37 @@ impl GameSaveApp {
                             scheduler::next_auto_backup_time_string(game, Local::now());
                     }
                     config_changed = true;
-                    if matches!(change_state, scheduler::BackupChangeState::NoSaveFolder)
-                        && self.selected_game_id.as_deref() == Some(game_id.as_str())
-                    {
-                        self.status = StatusMessage::warning(match self.language() {
-                            Language::ZhCn => "自动备份跳过：存档目录不存在".to_owned(),
-                            Language::EnUs => {
-                                "Automatic backup skipped: save folder does not exist".to_owned()
+                    match change_state {
+                        scheduler::BackupChangeState::NoSaveFolder => {
+                            logger::info(format!(
+                                "Automatic backup skipped for {}: save folder does not exist",
+                                game.name
+                            ));
+                            if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
+                                self.status = StatusMessage::warning(match self.language() {
+                                    Language::ZhCn => "自动备份跳过：存档目录不存在".to_owned(),
+                                    Language::EnUs => {
+                                        "Automatic backup skipped: save folder does not exist"
+                                            .to_owned()
+                                    }
+                                });
                             }
-                        });
+                        }
+                        scheduler::BackupChangeState::NoChanges => {
+                            logger::info(format!(
+                                "Automatic backup skipped for {}: no save changes",
+                                game.name
+                            ));
+                            if self.selected_game_id.as_deref() == Some(game_id.as_str()) {
+                                self.status = StatusMessage::info(match self.language() {
+                                    Language::ZhCn => "自动备份已跳过：存档没有变化".to_owned(),
+                                    Language::EnUs => {
+                                        "Automatic backup skipped: no save changes".to_owned()
+                                    }
+                                });
+                            }
+                        }
+                        scheduler::BackupChangeState::Changed { .. } => {}
                     }
                 }
                 BackgroundBackupDecision::Skip => {}
@@ -1521,6 +1583,25 @@ fn offset_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).rem_euclid(len) as usize
 }
 
+fn open_folder_error_message(
+    language: Language,
+    path: &Path,
+    _error: &dyn std::error::Error,
+) -> String {
+    match language {
+        Language::ZhCn => {
+            format!(
+                "打开目录失败：{}（系统无法打开或访问该路径）",
+                path.display()
+            )
+        }
+        Language::EnUs => format!(
+            "Failed to open folder: {} (The system could not open or access this path)",
+            path.display()
+        ),
+    }
+}
+
 fn steam_link_from_candidate(candidate: &SteamGameCandidate) -> SteamLink {
     SteamLink {
         app_id: candidate.app_id.clone(),
@@ -1539,6 +1620,24 @@ mod tests {
     use chrono::Local;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn open_folder_failure_message_is_localized_and_preserves_path() {
+        let path = Path::new(r"D:\Temp\123123");
+        let error = std::io::Error::other("IO error");
+
+        let zh = open_folder_error_message(Language::ZhCn, path, &error);
+        assert!(zh.contains("打开目录失败"));
+        assert!(!zh.contains("IO error"));
+        assert!(!zh.contains("I/O error"));
+        assert!(zh.contains(r"D:\Temp\123123"));
+
+        let en = open_folder_error_message(Language::EnUs, path, &error);
+        assert!(en.contains("Failed to open folder"));
+        assert!(!en.contains("打开目录失败"));
+        assert!(!en.contains("输入/输出错误"));
+        assert!(en.contains(r"D:\Temp\123123"));
+    }
 
     #[test]
     fn background_checks_create_due_auto_backup_through_real_backup_path() {
@@ -1584,7 +1683,11 @@ mod tests {
         app.run_background_checks();
 
         assert_eq!(app.backups.len(), 1);
-        assert_eq!(app.backups[0].label.as_deref(), Some("Automatic backup"));
+        assert_eq!(app.backups[0].label.as_deref(), Some("自动备份"));
+        assert_eq!(
+            app.backups[0].label_kind,
+            crate::models::BackupLabelKind::Automatic
+        );
         assert_eq!(app.status.kind, StatusKind::Success);
         let saved_game = app
             .config
@@ -1594,6 +1697,65 @@ mod tests {
             .unwrap();
         assert!(saved_game.auto_backup.last_auto_backup_at.is_some());
         assert!(saved_game.auto_backup.next_auto_backup_at.is_some());
+    }
+
+    #[test]
+    fn background_checks_skip_due_auto_backup_when_save_is_unchanged() {
+        let root = tempdir().unwrap();
+        let save = root.path().join("save");
+        fs::create_dir_all(&save).unwrap();
+        fs::write(save.join("slot.sav"), "one").unwrap();
+        let game = GameConfig {
+            id: "game".to_owned(),
+            name: "Game".to_owned(),
+            save_path: save,
+            max_backups: None,
+            auto_cleanup_enabled: true,
+            backup_storage_mode: BackupStorageMode::Incremental,
+            steam_link: None,
+            auto_backup: AutoBackupConfig {
+                enabled: true,
+                interval_hours: 1,
+                interval_minutes: Some(1),
+                interval_unit: AutoBackupIntervalUnit::Minutes,
+                change_reminder_enabled: true,
+                last_auto_backup_at: None,
+                last_reminded_snapshot_hash: None,
+                next_auto_backup_at: Some(
+                    (Local::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                ),
+            },
+        };
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game],
+            settings: Default::default(),
+        };
+        let mut app = test_app(config);
+        app.schedule_background_check_now();
+        app.run_background_checks();
+        assert_eq!(app.backups.len(), 1);
+
+        let first_state = app.config.games[0].auto_backup.clone();
+        app.config.games[0].auto_backup.next_auto_backup_at =
+            Some((Local::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        app.schedule_background_check_now();
+        app.run_background_checks();
+
+        assert_eq!(app.backups.len(), 1);
+        assert_eq!(
+            app.config.games[0].auto_backup.last_auto_backup_at,
+            first_state.last_auto_backup_at
+        );
+        assert_eq!(
+            app.config.games[0].auto_backup.last_reminded_snapshot_hash,
+            first_state.last_reminded_snapshot_hash
+        );
+        assert_ne!(
+            app.config.games[0].auto_backup.next_auto_backup_at,
+            first_state.next_auto_backup_at
+        );
+        assert!(app.status.text.contains("没有变化"));
     }
 
     fn test_app(config: AppConfig) -> GameSaveApp {

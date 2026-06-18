@@ -30,11 +30,11 @@ fn main() -> eframe::Result<()> {
     let loaded_config = config::load_or_create_config().ok();
     let saved_window = loaded_config
         .as_ref()
-        .map(|config| config.settings.main_window)
+        .map(|loaded| loaded.config.settings.main_window)
         .unwrap_or_default();
     let language = loaded_config
         .as_ref()
-        .map(|config| config.settings.language)
+        .map(|loaded| loaded.config.settings.language)
         .unwrap_or(Language::ZhCn);
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
@@ -61,7 +61,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         t(language, T::AppTitle),
         options,
-        Box::new(move |cc| Box::new(GameSaveApp::new(cc, app_icon.clone()))),
+        Box::new(move |cc| {
+            Box::new(GameSaveApp::new(
+                cc,
+                app_icon.clone(),
+                loaded_config.clone(),
+            ))
+        }),
     )
 }
 

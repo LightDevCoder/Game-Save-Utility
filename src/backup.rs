@@ -5,18 +5,56 @@ use crate::fs_utils::{
 };
 use crate::logger;
 use crate::models::{
-    AppConfig, AppError, AppResult, BackupEntry, BackupMetadata, BackupStorageKind,
-    BackupStorageMode, GameConfig, IncrementalBackupKind, TOOL_VERSION,
+    system_backup_label, AppConfig, AppError, AppResult, BackupEntry, BackupLabelKind,
+    BackupMetadata, BackupStorageKind, BackupStorageMode, GameConfig, IncrementalBackupKind,
+    Language, TOOL_VERSION,
 };
 use crate::{archive, config, snapshot};
 use chrono::{DateTime, Local};
-use serde_json::to_string_pretty;
+use serde_json::{to_string_pretty, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const METADATA_FILE: &str = "metadata.json";
 const SAVE_FILES_DIR: &str = "save_files";
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackupCreateOptions<'a> {
+    pub label: Option<&'a str>,
+    pub label_kind: BackupLabelKind,
+    pub language: Language,
+    pub allow_empty: bool,
+}
+
+impl<'a> BackupCreateOptions<'a> {
+    pub fn manual(label: Option<&'a str>, language: Language, allow_empty: bool) -> Self {
+        Self {
+            label,
+            label_kind: BackupLabelKind::Manual,
+            language,
+            allow_empty,
+        }
+    }
+
+    pub fn automatic(language: Language) -> Self {
+        Self {
+            label: None,
+            label_kind: BackupLabelKind::Automatic,
+            language,
+            allow_empty: false,
+        }
+    }
+
+    pub fn pre_restore(language: Language) -> Self {
+        Self {
+            label: None,
+            label_kind: BackupLabelKind::PreRestore,
+            language,
+            allow_empty: true,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct BackupPayloadSummary {
@@ -49,15 +87,13 @@ pub fn ensure_game_backup_dir(config: &AppConfig, game: &GameConfig) -> AppResul
 pub fn create_backup(
     config: &AppConfig,
     game: &GameConfig,
-    label: Option<&str>,
-    is_pre_restore_backup: bool,
-    allow_empty: bool,
+    options: BackupCreateOptions<'_>,
 ) -> AppResult<BackupEntry> {
     let save_path = expand_path(&game.save_path);
     validate_save_dir(&save_path)?;
 
     let stats = directory_stats(&save_path)?;
-    if stats.file_count == 0 && !allow_empty {
+    if stats.file_count == 0 && !options.allow_empty {
         return Err(AppError::EmptySaveDir { path: save_path });
     }
 
@@ -70,7 +106,7 @@ pub fn create_backup(
 
     let created_at = Local::now();
     let timestamp = backup_timestamp();
-    let normalized_label = normalize_label(label, is_pre_restore_backup);
+    let normalized_label = normalize_label(options);
     let dir_name = backup_dir_name(&timestamp, normalized_label.as_deref());
     let final_dir = unique_child_path(&backup_root, &dir_name);
     let temp_dir = backup_root.join(format!(".tmp_{}_{}", dir_name, Uuid::new_v4()));
@@ -93,7 +129,8 @@ pub fn create_backup(
             file_count: storage_summary.file_count,
             total_size: storage_summary.total_size,
             tool_version: TOOL_VERSION.to_owned(),
-            is_pre_restore_backup,
+            is_pre_restore_backup: options.label_kind == BackupLabelKind::PreRestore,
+            label_kind: options.label_kind,
             storage_kind: storage_summary.storage_kind,
             manifest_path: storage_summary.manifest_path,
             archive_path: storage_summary.archive_path,
@@ -115,7 +152,8 @@ pub fn create_backup(
             file_count: storage_summary.file_count,
             total_size: storage_summary.total_size,
             stored_size: storage_summary.stored_size,
-            is_pre_restore_backup,
+            is_pre_restore_backup: options.label_kind == BackupLabelKind::PreRestore,
+            label_kind: options.label_kind,
             storage_kind: storage_summary.storage_kind,
             incremental_kind: storage_summary.incremental_kind,
         })
@@ -133,7 +171,7 @@ pub fn create_backup(
         }
         Err(err) => {
             let _ = remove_dir_all_if_exists(&temp_dir, "Failed backup temp cleanup failed");
-            logger::error(format!("Backup failed: {}", err.user_message()));
+            logger::error(format!("Backup failed: {err}"));
             Err(err)
         }
     }
@@ -179,12 +217,12 @@ pub fn scan_backups(config: &AppConfig, game: &GameConfig) -> AppResult<Vec<Back
             Err(err) => logger::warn(format!(
                 "Skipping invalid backup node {}: {}",
                 path.display(),
-                err.user_message()
+                err
             )),
         }
     }
 
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
     infer_missing_incremental_kinds(&mut entries);
     Ok(entries)
 }
@@ -237,9 +275,7 @@ pub fn restore_backup(
     let pre_restore_backup = create_backup(
         config,
         &pre_restore_game,
-        Some("Pre-restore automatic backup"),
-        true,
-        true,
+        BackupCreateOptions::pre_restore(config.settings.language),
     )?;
 
     let parent = target
@@ -288,11 +324,10 @@ pub fn restore_backup(
             logger::info(format!("Restore complete: {}", backup.path.display()));
             if game.auto_cleanup_enabled {
                 if let Some(max_backups) = game.max_backups {
-                    if let Err(err) = cleanup_old_backups(config, game, max_backups) {
-                        logger::warn(format!(
-                            "Post-restore cleanup failed: {}",
-                            err.user_message()
-                        ));
+                    if let Err(err) =
+                        cleanup_old_backups_inner(config, game, max_backups, Some(&backup.path))
+                    {
+                        logger::warn(format!("Post-restore cleanup failed: {err}"));
                     }
                 }
             }
@@ -302,7 +337,7 @@ pub fn restore_backup(
             let _ = remove_dir_all_if_exists(&stage_dir, "Restore temp cleanup failed");
             logger::error(format!(
                 "Restore failed: {}; pre-restore safety backup: {}",
-                err.user_message(),
+                err,
                 pre_restore_backup.path.display()
             ));
             Err(err)
@@ -315,17 +350,32 @@ pub fn cleanup_old_backups(
     game: &GameConfig,
     max_backups: usize,
 ) -> AppResult<usize> {
+    cleanup_old_backups_inner(config, game, max_backups, None)
+}
+
+fn cleanup_old_backups_inner(
+    config: &AppConfig,
+    game: &GameConfig,
+    max_backups: usize,
+    protected_path: Option<&Path>,
+) -> AppResult<usize> {
     if max_backups == 0 {
         return Ok(0);
     }
 
-    let entries = scan_backups(config, game)?;
-    if entries.len() <= max_backups {
+    let automatic_backups: Vec<BackupEntry> = scan_backups(config, game)?
+        .into_iter()
+        .filter(|entry| entry.label_kind == BackupLabelKind::Automatic)
+        .collect();
+    if automatic_backups.len() <= max_backups {
         return Ok(0);
     }
 
     let mut deleted = 0;
-    for entry in entries.into_iter().skip(max_backups) {
+    for entry in automatic_backups.into_iter().skip(max_backups) {
+        if protected_path.is_some_and(|path| path == entry.path) {
+            continue;
+        }
         delete_backup(&entry)?;
         deleted += 1;
     }
@@ -459,12 +509,13 @@ fn materialize_backup_payload(backup: &BackupEntry, stage_dir: &Path) -> AppResu
     }
 }
 
-fn normalize_label(label: Option<&str>, is_pre_restore_backup: bool) -> Option<String> {
-    if is_pre_restore_backup {
-        return Some("Pre-restore automatic backup".to_owned());
+fn normalize_label(options: BackupCreateOptions<'_>) -> Option<String> {
+    if let Some(label) = system_backup_label(options.label_kind, options.language) {
+        return Some(label.to_owned());
     }
 
-    label
+    options
+        .label
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
@@ -489,7 +540,31 @@ fn read_metadata(path: &Path) -> AppResult<BackupMetadata> {
     let metadata_path = path.join(METADATA_FILE);
     let raw = fs::read_to_string(&metadata_path)
         .map_err(|err| AppError::io("Backup metadata read failed", &metadata_path, err))?;
-    Ok(serde_json::from_str(&raw)?)
+    let value: Value = serde_json::from_str(&raw)?;
+    let has_label_kind = value.get("label_kind").is_some();
+    let mut metadata: BackupMetadata = serde_json::from_value(value)?;
+    if !has_label_kind {
+        metadata.label_kind = infer_legacy_label_kind(&metadata);
+    }
+    Ok(metadata)
+}
+
+fn infer_legacy_label_kind(metadata: &BackupMetadata) -> BackupLabelKind {
+    if metadata.is_pre_restore_backup
+        || matches!(
+            metadata.label.as_deref(),
+            Some("Pre-restore automatic backup" | "恢复前自动备份")
+        )
+    {
+        BackupLabelKind::PreRestore
+    } else if matches!(
+        metadata.label.as_deref(),
+        Some("Automatic backup" | "自动备份")
+    ) {
+        BackupLabelKind::Automatic
+    } else {
+        BackupLabelKind::Manual
+    }
 }
 
 fn read_backup_entry(game: &GameConfig, path: &Path) -> AppResult<BackupEntry> {
@@ -507,7 +582,8 @@ fn read_backup_entry(game: &GameConfig, path: &Path) -> AppResult<BackupEntry> {
         file_count: metadata.file_count,
         total_size: metadata.total_size,
         stored_size: metadata.stored_size,
-        is_pre_restore_backup: metadata.is_pre_restore_backup,
+        is_pre_restore_backup: metadata.label_kind == BackupLabelKind::PreRestore,
+        label_kind: metadata.label_kind,
         storage_kind: metadata.storage_kind,
         incremental_kind: metadata.incremental_kind,
     })
@@ -594,7 +670,12 @@ mod tests {
             settings: Default::default(),
         };
 
-        let first = create_backup(&config, &game, Some("before choice"), false, false).unwrap();
+        let first = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(Some("before choice"), Language::EnUs, false),
+        )
+        .unwrap();
         assert_eq!(first.storage_kind, BackupStorageKind::Incremental);
 
         fs::write(save_dir.join("slot1.sav"), "after").unwrap();
@@ -634,6 +715,7 @@ mod tests {
             total_size: 6,
             tool_version: "0.1.0".to_owned(),
             is_pre_restore_backup: false,
+            label_kind: BackupLabelKind::Manual,
             storage_kind: BackupStorageKind::LegacyDirectory,
             manifest_path: None,
             archive_path: None,
@@ -641,7 +723,13 @@ mod tests {
             stored_size: None,
             incremental_kind: None,
         };
-        write_metadata(&backup_dir, &metadata).unwrap();
+        let mut legacy_value = serde_json::to_value(&metadata).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("label_kind");
+        fs::write(
+            backup_dir.join(METADATA_FILE),
+            serde_json::to_vec_pretty(&legacy_value).unwrap(),
+        )
+        .unwrap();
         let config = AppConfig {
             backup_root,
             games: vec![game.clone()],
@@ -672,7 +760,12 @@ mod tests {
             settings: Default::default(),
         };
 
-        let first = create_backup(&config, &game, None, false, false).unwrap();
+        let first = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(None, Language::EnUs, false),
+        )
+        .unwrap();
         assert_eq!(first.storage_kind, BackupStorageKind::Zip);
         assert!(first.stored_size.is_some());
 
@@ -705,7 +798,12 @@ mod tests {
             settings: Default::default(),
         };
 
-        let backup = create_backup(&config, &game, None, false, false).unwrap();
+        let backup = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(None, Language::EnUs, false),
+        )
+        .unwrap();
         let game_dir = game_backup_dir(&config, &game);
         assert!(game_dir.join(snapshot::OBJECT_STORE_DIR).exists());
 
@@ -738,11 +836,21 @@ mod tests {
             settings: Default::default(),
         };
 
-        let first = create_backup(&config, &game, Some("first"), false, false).unwrap();
+        let first = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(Some("first"), Language::EnUs, false),
+        )
+        .unwrap();
         assert_eq!(first.incremental_kind, Some(IncrementalBackupKind::Full));
 
         fs::write(save_dir.join("slot1.sav"), "two").unwrap();
-        let second = create_backup(&config, &game, Some("second"), false, false).unwrap();
+        let second = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(Some("second"), Language::EnUs, false),
+        )
+        .unwrap();
         assert_eq!(
             second.incremental_kind,
             Some(IncrementalBackupKind::Incremental)
@@ -791,6 +899,295 @@ mod tests {
         delete_game_backup_dir(&config, &game).unwrap();
 
         assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_keeps_only_latest_automatic_backup_and_preserves_protected_kinds() {
+        let root = tempdir().unwrap();
+        let save_dir = root.path().join("save");
+        fs::create_dir_all(&save_dir).unwrap();
+        fs::write(save_dir.join("slot.sav"), "one").unwrap();
+        let game = test_game(
+            "game-1",
+            "Cleanup Game",
+            &save_dir,
+            BackupStorageMode::Incremental,
+        );
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game.clone()],
+            settings: Default::default(),
+        };
+
+        let manual = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(None, Language::EnUs, false),
+        )
+        .unwrap();
+        let custom = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(Some("boss choice"), Language::EnUs, false),
+        )
+        .unwrap();
+        let pre_restore = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::pre_restore(Language::EnUs),
+        )
+        .unwrap();
+
+        let mut automatic_paths = Vec::new();
+        for value in ["auto-one", "auto-two", "auto-three"] {
+            fs::write(save_dir.join("slot.sav"), value).unwrap();
+            automatic_paths.push(
+                create_backup(
+                    &config,
+                    &game,
+                    BackupCreateOptions::automatic(Language::EnUs),
+                )
+                .unwrap()
+                .path,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let latest_automatic = automatic_paths.last().unwrap().clone();
+
+        assert_eq!(cleanup_old_backups(&config, &game, 1).unwrap(), 2);
+        let remaining = scan_backups(&config, &game).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|entry| entry.label_kind == BackupLabelKind::Automatic)
+                .count(),
+            1
+        );
+        assert!(remaining.iter().any(|entry| entry.path == latest_automatic));
+        assert!(remaining.iter().any(|entry| entry.path == manual.path));
+        assert!(remaining.iter().any(|entry| entry.path == custom.path));
+        assert!(remaining.iter().any(|entry| entry.path == pre_restore.path));
+    }
+
+    #[test]
+    fn post_restore_cleanup_does_not_delete_restored_automatic_backup() {
+        let root = tempdir().unwrap();
+        let save_dir = root.path().join("save");
+        fs::create_dir_all(&save_dir).unwrap();
+        fs::write(save_dir.join("slot.sav"), "old").unwrap();
+        let game = test_game(
+            "game-1",
+            "Restore Cleanup Game",
+            &save_dir,
+            BackupStorageMode::Incremental,
+        );
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game.clone()],
+            settings: Default::default(),
+        };
+        let restored_target = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::automatic(Language::EnUs),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(save_dir.join("slot.sav"), "new").unwrap();
+        let newer = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::automatic(Language::EnUs),
+        )
+        .unwrap();
+
+        let mut cleanup_game = game.clone();
+        cleanup_game.auto_cleanup_enabled = true;
+        cleanup_game.max_backups = Some(1);
+        restore_backup(&config, &cleanup_game, &restored_target).unwrap();
+
+        let remaining = scan_backups(&config, &cleanup_game).unwrap();
+        assert!(remaining
+            .iter()
+            .any(|entry| entry.path == restored_target.path));
+        assert!(remaining.iter().any(|entry| entry.path == newer.path));
+        assert_eq!(
+            fs::read_to_string(save_dir.join("slot.sav")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn system_backup_labels_are_persisted_in_creation_language() {
+        let root = tempdir().unwrap();
+        let save_dir = root.path().join("save");
+        fs::create_dir_all(&save_dir).unwrap();
+        fs::write(save_dir.join("slot.sav"), "one").unwrap();
+        let game = test_game(
+            "game-1",
+            "Label Game",
+            &save_dir,
+            BackupStorageMode::Incremental,
+        );
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game.clone()],
+            settings: Default::default(),
+        };
+
+        let zh_auto = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::automatic(Language::ZhCn),
+        )
+        .unwrap();
+        let zh_pre = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::pre_restore(Language::ZhCn),
+        )
+        .unwrap();
+        let en_auto = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::automatic(Language::EnUs),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_metadata(&zh_auto.path).unwrap().label.as_deref(),
+            Some("自动备份")
+        );
+        assert!(zh_auto
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("自动备份"));
+        assert_eq!(
+            read_metadata(&zh_pre.path).unwrap().label.as_deref(),
+            Some("恢复前自动备份")
+        );
+        assert_eq!(
+            read_metadata(&en_auto.path).unwrap().label.as_deref(),
+            Some("Automatic backup")
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_label_kind_is_inferred_and_restorable() {
+        let root = tempdir().unwrap();
+        let save_dir = root.path().join("save");
+        let backup_root = root.path().join("backups");
+        fs::create_dir_all(&save_dir).unwrap();
+        fs::write(save_dir.join("slot.sav"), "legacy-auto").unwrap();
+        let game = test_game(
+            "game-1",
+            "Legacy Kind Game",
+            &save_dir,
+            BackupStorageMode::Incremental,
+        );
+        let config = AppConfig {
+            backup_root,
+            games: vec![game.clone()],
+            settings: Default::default(),
+        };
+        let backup = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::automatic(Language::EnUs),
+        )
+        .unwrap();
+        let metadata_path = backup.path.join(METADATA_FILE);
+        let mut value: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("label_kind");
+        fs::write(&metadata_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        fs::write(save_dir.join("slot.sav"), "current").unwrap();
+
+        let scanned = scan_backups(&config, &game).unwrap().remove(0);
+        assert_eq!(scanned.label_kind, BackupLabelKind::Automatic);
+        restore_backup(&config, &game, &scanned).unwrap();
+        assert_eq!(
+            fs::read_to_string(save_dir.join("slot.sav")).unwrap(),
+            "legacy-auto"
+        );
+    }
+
+    #[test]
+    fn legacy_pre_restore_flag_is_inferred_without_label_kind() {
+        let metadata = BackupMetadata {
+            game_name: "Game".to_owned(),
+            original_save_path: PathBuf::from("save"),
+            created_at: Local::now().to_rfc3339(),
+            label: None,
+            file_count: 1,
+            total_size: 1,
+            tool_version: "0.1.0".to_owned(),
+            is_pre_restore_backup: true,
+            label_kind: BackupLabelKind::Manual,
+            storage_kind: BackupStorageKind::LegacyDirectory,
+            manifest_path: None,
+            archive_path: None,
+            snapshot_hash: None,
+            stored_size: None,
+            incremental_kind: None,
+        };
+
+        assert_eq!(
+            infer_legacy_label_kind(&metadata),
+            BackupLabelKind::PreRestore
+        );
+    }
+
+    #[test]
+    fn corrupted_incremental_object_stops_restore_and_keeps_current_save_and_safety_backup() {
+        let root = tempdir().unwrap();
+        let save_dir = root.path().join("save");
+        fs::create_dir_all(&save_dir).unwrap();
+        fs::write(save_dir.join("slot.sav"), "backup-version").unwrap();
+        let game = test_game(
+            "game-1",
+            "Corruption Game",
+            &save_dir,
+            BackupStorageMode::Incremental,
+        );
+        let config = AppConfig {
+            backup_root: root.path().join("backups"),
+            games: vec![game.clone()],
+            settings: Default::default(),
+        };
+        let backup = create_backup(
+            &config,
+            &game,
+            BackupCreateOptions::manual(Some("safe"), Language::EnUs, false),
+        )
+        .unwrap();
+        fs::write(save_dir.join("slot.sav"), "current-version").unwrap();
+
+        let manifest = snapshot::read_manifest(&backup.path.join(snapshot::MANIFEST_FILE)).unwrap();
+        let object_hash = manifest.files[0].sha256.clone();
+        let object_path = game_backup_dir(&config, &game)
+            .join(snapshot::OBJECT_STORE_DIR)
+            .join(&object_hash[..2])
+            .join(&object_hash);
+        fs::write(&object_path, "tampered").unwrap();
+
+        let err = restore_backup(&config, &game, &backup).unwrap_err();
+        assert!(matches!(err, AppError::IncrementalObjectCorrupted { .. }));
+        assert_eq!(
+            fs::read_to_string(save_dir.join("slot.sav")).unwrap(),
+            "current-version"
+        );
+        let remaining = scan_backups(&config, &game).unwrap();
+        assert!(remaining
+            .iter()
+            .any(|entry| entry.label_kind == BackupLabelKind::PreRestore));
+        assert!(err
+            .user_message_for_language(Language::ZhCn)
+            .contains(&object_hash));
+        assert!(err
+            .user_message_for_language(Language::EnUs)
+            .contains(&object_path.display().to_string()));
     }
 
     fn test_game(id: &str, name: &str, save_dir: &Path, mode: BackupStorageMode) -> GameConfig {

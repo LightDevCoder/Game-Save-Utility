@@ -63,8 +63,10 @@ impl GameSaveApp {
                             ui.add_sized(
                                 [path_width, 24.0],
                                 egui::Label::new(
-                                    egui::RichText::new(err.user_message())
-                                        .color(egui::Color32::RED),
+                                    egui::RichText::new(
+                                        err.user_message_for_language(self.language()),
+                                    )
+                                    .color(egui::Color32::RED),
                                 )
                                 .truncate(true),
                             );
@@ -384,20 +386,21 @@ impl GameSaveApp {
 }
 
 fn backup_label_text(language: Language, backup: &BackupEntry, no_label: &str) -> String {
-    if backup.is_pre_restore_backup {
-        return match language {
-            Language::ZhCn => "恢复前自动备份".to_owned(),
-            Language::EnUs => "Pre-restore automatic backup".to_owned(),
-        };
-    }
-
-    match backup.label.as_deref() {
-        Some("Automatic backup") => match language {
-            Language::ZhCn => "自动备份".to_owned(),
-            Language::EnUs => "Automatic backup".to_owned(),
+    match backup.label_kind {
+        crate::models::BackupLabelKind::Automatic => {
+            crate::models::system_backup_label(backup.label_kind, language)
+                .unwrap_or_default()
+                .to_owned()
+        }
+        crate::models::BackupLabelKind::PreRestore => {
+            crate::models::system_backup_label(backup.label_kind, language)
+                .unwrap_or_default()
+                .to_owned()
+        }
+        crate::models::BackupLabelKind::Manual => match backup.label.as_deref() {
+            Some(label) => label.to_owned(),
+            None => no_label.to_owned(),
         },
-        Some(label) => label.to_owned(),
-        None => no_label.to_owned(),
     }
 }
 
@@ -531,5 +534,41 @@ fn storage_mode_label(language: crate::models::Language, mode: BackupStorageMode
             BackupStorageMode::Incremental => "Incremental",
             BackupStorageMode::Zip => "ZIP compressed",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{BackupLabelKind, BackupStorageKind};
+    use chrono::Local;
+    use std::path::PathBuf;
+
+    #[test]
+    fn backup_label_display_uses_stable_kind_before_persisted_label() {
+        let mut backup = BackupEntry {
+            game_id: "game".to_owned(),
+            game_name: "Game".to_owned(),
+            path: PathBuf::from("backup"),
+            created_at: Local::now(),
+            label: Some("Automatic backup".to_owned()),
+            file_count: 1,
+            total_size: 1,
+            stored_size: Some(1),
+            is_pre_restore_backup: false,
+            label_kind: BackupLabelKind::Manual,
+            storage_kind: BackupStorageKind::Incremental,
+            incremental_kind: None,
+        };
+
+        assert_eq!(
+            backup_label_text(Language::ZhCn, &backup, "无标签"),
+            "Automatic backup"
+        );
+        backup.label_kind = BackupLabelKind::Automatic;
+        assert_eq!(
+            backup_label_text(Language::ZhCn, &backup, "无标签"),
+            "自动备份"
+        );
     }
 }

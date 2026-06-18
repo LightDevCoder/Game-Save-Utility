@@ -54,7 +54,7 @@ pub fn scan_installed_games() -> AppResult<Vec<SteamGameCandidate>> {
     }
 
     let mut games = scan_with_steam_roots(&steam_roots)?;
-    games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    games.sort_by_key(|game| game.name.to_lowercase());
     Ok(games)
 }
 

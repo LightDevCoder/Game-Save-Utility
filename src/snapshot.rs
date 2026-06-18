@@ -112,6 +112,13 @@ pub fn materialize_incremental_backup(backup_node_dir: &Path, target_dir: &Path)
                 file.sha256
             )));
         }
+        let (actual_sha256, actual_size) = hash_file(&object_path)?;
+        if actual_sha256 != file.sha256 || actual_size != file.size {
+            return Err(AppError::IncrementalObjectCorrupted {
+                sha256: file.sha256,
+                path: object_path,
+            });
+        }
 
         let dst = target_dir.join(&file.relative_path);
         if let Some(parent) = dst.parent() {
@@ -177,6 +184,7 @@ pub fn read_manifest(path: &Path) -> AppResult<SnapshotManifest> {
     let manifest: SnapshotManifest = serde_json::from_str(&raw)?;
     for file in &manifest.files {
         validate_relative_path(&file.relative_path)?;
+        validate_sha256_hex(&file.sha256)?;
     }
     Ok(manifest)
 }
@@ -291,6 +299,15 @@ fn object_path(object_store: &Path, sha256: &str) -> PathBuf {
     object_store.join(prefix).join(sha256)
 }
 
+fn validate_sha256_hex(value: &str) -> AppResult<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::message(format!(
+            "Manifest contains an invalid SHA-256 value: {value}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_relative_path(path: &Path) -> AppResult<()> {
     if path.as_os_str().is_empty() {
         return Err(AppError::message("Manifest contains an empty path"));
@@ -397,5 +414,78 @@ mod tests {
         fs::remove_dir_all(&backup).unwrap();
         let deleted = garbage_collect_objects(&game_backup).unwrap();
         assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn read_manifest_rejects_invalid_sha256_values() {
+        let root = tempdir().unwrap();
+        let path = root.path().join(MANIFEST_FILE);
+        for value in [
+            "".to_owned(),
+            "abc".to_owned(),
+            "../evil".to_owned(),
+            "g".repeat(64),
+        ] {
+            let manifest = serde_json::json!({
+                "version": 1,
+                "files": [{
+                    "relative_path": "slot.sav",
+                    "size": 1,
+                    "sha256": &value
+                }]
+            });
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(read_manifest(&path).is_err(), "value should fail: {value}");
+        }
+    }
+
+    #[test]
+    fn read_manifest_accepts_valid_sha256() {
+        let root = tempdir().unwrap();
+        let path = root.path().join(MANIFEST_FILE);
+        let manifest = SnapshotManifest {
+            version: 1,
+            files: vec![SnapshotFile {
+                relative_path: PathBuf::from("slot.sav"),
+                size: 1,
+                sha256: "a".repeat(64),
+            }],
+        };
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert_eq!(read_manifest(&path).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn materialize_rejects_corrupted_object_and_identifies_it() {
+        let root = tempdir().unwrap();
+        let save = root.path().join("save");
+        let game_backup = root.path().join("backups").join("Game");
+        let backup = game_backup.join("backup");
+        fs::create_dir_all(&save).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(save.join("slot.sav"), "original").unwrap();
+        create_incremental_snapshot(&save, &game_backup, &backup).unwrap();
+
+        let manifest = read_manifest(&backup.join(MANIFEST_FILE)).unwrap();
+        let object_hash = manifest.files[0].sha256.clone();
+        let corrupted_path = object_path(&game_backup.join(OBJECT_STORE_DIR), &object_hash);
+        fs::write(&corrupted_path, "corrupted").unwrap();
+
+        let restore = root.path().join("restore");
+        let err = materialize_incremental_backup(&backup, &restore).unwrap_err();
+        match &err {
+            AppError::IncrementalObjectCorrupted { sha256, path } => {
+                assert_eq!(sha256, &object_hash);
+                assert_eq!(path, &corrupted_path);
+            }
+            _ => panic!("unexpected error: {err}"),
+        }
+        let detail = err.to_string();
+        assert!(detail.contains(&object_hash));
+        assert!(err
+            .user_message_for_language(crate::models::Language::EnUs)
+            .contains(&corrupted_path.display().to_string()));
+        assert!(!restore.join("slot.sav").exists());
     }
 }

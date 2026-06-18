@@ -98,9 +98,7 @@ pub fn background_backup_decision(
     if game.auto_backup.enabled && auto_backup_is_due(game, now) {
         return match change_state {
             BackupChangeState::NoSaveFolder => BackgroundBackupDecision::AdvanceTimer,
-            BackupChangeState::NoChanges => BackgroundBackupDecision::AutoBackup {
-                snapshot_hash: None,
-            },
+            BackupChangeState::NoChanges => BackgroundBackupDecision::AdvanceTimer,
             BackupChangeState::Changed { snapshot_hash } => BackgroundBackupDecision::AutoBackup {
                 snapshot_hash: Some(snapshot_hash.clone()),
             },
@@ -207,9 +205,7 @@ mod tests {
                 &BackupChangeState::NoChanges,
                 Local.with_ymd_and_hms(2026, 6, 15, 8, 1, 0).unwrap()
             ),
-            BackgroundBackupDecision::AutoBackup {
-                snapshot_hash: None
-            }
+            BackgroundBackupDecision::AdvanceTimer
         );
     }
 
@@ -281,9 +277,7 @@ mod tests {
                 &BackupChangeState::NoChanges,
                 Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap()
             ),
-            BackgroundBackupDecision::AutoBackup {
-                snapshot_hash: None
-            }
+            BackgroundBackupDecision::AdvanceTimer
         );
     }
 
@@ -309,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn background_decision_auto_backs_up_due_timer_without_changes_for_minutes_and_hours() {
+    fn background_decision_advances_due_timer_without_changes_for_minutes_and_hours() {
         let mut game = test_game(PathBuf::from("save"));
         game.auto_backup.enabled = true;
         game.auto_backup.change_reminder_enabled = false;
@@ -327,9 +321,7 @@ mod tests {
                 &BackupChangeState::NoChanges,
                 Local.with_ymd_and_hms(2026, 6, 15, 8, 10, 0).unwrap()
             ),
-            BackgroundBackupDecision::AutoBackup {
-                snapshot_hash: None
-            }
+            BackgroundBackupDecision::AdvanceTimer
         );
 
         game.auto_backup.interval_minutes = Some(120);
@@ -345,9 +337,7 @@ mod tests {
                 &BackupChangeState::NoChanges,
                 Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap()
             ),
-            BackgroundBackupDecision::AutoBackup {
-                snapshot_hash: None
-            }
+            BackgroundBackupDecision::AdvanceTimer
         );
     }
 
@@ -392,7 +382,12 @@ mod tests {
             BackupChangeState::Changed { .. }
         ));
 
-        backup::create_backup(&config, &game, None, false, false).unwrap();
+        backup::create_backup(
+            &config,
+            &game,
+            backup::BackupCreateOptions::manual(None, config.settings.language, false),
+        )
+        .unwrap();
         assert_eq!(
             backup_change_state(&config, &game).unwrap(),
             BackupChangeState::NoChanges

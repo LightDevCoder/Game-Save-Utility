@@ -235,8 +235,8 @@ const DATA_LINES: &[HelpLine] = &[
         "数据目录保存配置、日志和默认备份目录。可以通过顶部“更改并迁移”选择新位置。",
         "The data folder stores config, logs, and the default backup root. Use Move Data in the toolbar to choose a new location."
     ),
-    b!("如果选择普通父目录，工具会在其中创建 GameSaveBackupTool 文件夹。", "If you choose a normal parent folder, the tool creates GameSaveBackupTool inside it."),
-    b!("迁移成功后，旧的 GameSaveBackupTool 文件夹会整体删除。", "After migration succeeds, the old GameSaveBackupTool folder is removed."),
+        b!("如果选择普通父目录，工具会在其中创建 GameSaveUtility 文件夹。", "If you choose a normal parent folder, the tool creates GameSaveUtility inside it."),
+        b!("首次运行新版时，如果新目录不存在，旧的 GameSaveBackupTool 目录会安全迁移为 GameSaveUtility。", "On the first run of the renamed version, the legacy GameSaveBackupTool folder is safely migrated to GameSaveUtility when the new folder does not exist."),
 ];
 
 const TRAY_LINES: &[HelpLine] = &[
